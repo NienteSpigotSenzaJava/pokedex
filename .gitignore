@@ -1,0 +1,17 @@
+node_modules/
+.npm-cache/
+
+**/dist/
+**/*.tsbuildinfo
+coverage/
+
+.env
+.env.*
+
+*.pem
+*.key
+*.patch
+
+.DS_Store
+__MACOSX/
+Thumbs.db

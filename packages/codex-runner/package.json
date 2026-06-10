@@ -1,0 +1,18 @@
+{
+  "name": "@pokedex/codex-runner",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "package.json"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pokedex/protocol": "0.1.0",
+    "@pokedex/security": "0.1.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@pokedex/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "pokedex": "src/index.js"
+  },
+  "files": ["src", "dist", "package.json"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node src/index.js",
+    "prepack": "npm run build"
+  }
+}
