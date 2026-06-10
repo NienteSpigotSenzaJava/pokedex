@@ -1,11 +1,30 @@
 {
-  "name": "@pokedex/cli",
-  "version": "0.1.0",
+  "name": "codex-to-poke",
+  "version": "0.1.2",
+  "description": "Unofficial local Poke to Codex bridge.",
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "codex",
+    "poke",
+    "mcp",
+    "cli",
+    "pokedex"
+  ],
   "bin": {
     "pokedex": "src/index.js"
   },
-  "files": ["src", "dist", "package.json"],
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "package.json"
+  ],
   "publishConfig": {
     "access": "public"
   },

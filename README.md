@@ -1,102 +1,163 @@
-# Pokedex
+# The Codex to Poke Bridge
 
-🧭 Pokedex connects a Poke recipe to your local Codex app-server.
+![Pokedex](./assets/hero.png)
 
-It runs on your machine, keeps your files local, and exposes Codex through a small local MCP relay.
+Pokedex connects your local Codex to your Poke.
+
+It runs on your machine, keeps workspace access local, and exposes Codex through a small authenticated MCP relay.
 
 ```text
-Poke -> Poke tunnel -> Pokedex relay -> Pokedex agent -> Codex app-server
+Codex App Server -> Pokedex agent -> Pokedex relay -> Poke Tunnel -> Your Poke
 ```
 
-## Quick Start
+## Usage
+
+```bash
+npx codex-to-poke
+```
+
+## Setup
+
+Authenticate Codex before starting Pokedex. Pokedex starts the Poke login flow automatically if the tunnel needs it.
 
 ```bash
 codex login
-npx poke@latest login
-npx @pokedex/cli
 ```
 
-Keep the terminal open while you use the Pokedex recipe in Poke.
-
-## Config
-
-Pokedex stores its config in your home directory:
-
-```text
-~/.pokedex/config.json
-```
-
-On Windows, `~` means your current user home folder. The config is not written to the project where you run Pokedex.
-
-The config contains the local port, relay token, Codex command, default model, permissions, and workspace list.
-
-## Permissions
-
-Pokedex starts in read-only mode.
-
-```bash
-npx @pokedex/cli --read-only
-npx @pokedex/cli --write
-npx @pokedex/cli --full-access
-```
-
-Use `--full-access` only for projects and machines you trust.
-
-## Workspaces
-
-By default, the first run saves the folder where you started Pokedex as the `main` workspace.
+Then start Pokedex in the workspace you want Codex to see:
 
 ```bash
 cd /path/to/project
-npx @pokedex/cli
+npx codex-to-poke
 ```
 
-You can also choose a workspace directly:
+When the terminal says it is ready, try saying "is pokedex connected?" to your Poke. Type `help` in the Pokedex prompt to see commands.
+
+## Permissions
+
+Pokedex starts read-only unless your saved config already allows writes.
 
 ```bash
-npx @pokedex/cli --workspace /path/to/project
+npx codex-to-poke --read-only
+npx codex-to-poke --write
+npx codex-to-poke --full-access
 ```
 
-Inside the interactive prompt:
+Use `--write` for normal code changes. Use `--full-access` only on machines and projects you trust.
+
+## Workspaces
+
+The first run stores the current folder as the `main` workspace. You can choose another workspace with:
+
+```bash
+npx codex-to-poke --workspace /path/to/project
+```
+
+Inside the prompt:
 
 ```text
 workspace list
 workspace add api /path/to/api
 workspace use api
-write on
+workspace write api on
+restart
+```
+
+## Prompt Commands
+
+```text
+status
+config
+output [relay|agent|poke]
+write [on|off]
+full-access [on|off]
+workspace list
+workspace add <alias> <path> [description]
+workspace remove <alias>
+workspace use <alias>
+workspace describe <alias> <description>
+workspace write <alias> [on|off]
+workspace full-access <alias> [on|off]
+model <name>
+reasoning minimal|low|medium|high|xhigh
+verbosity low|medium|high
+approval untrusted|on-request|never
+codex <command> [app-server args...]
+port <number>
+token rotate
 restart
 quit
 ```
 
-## MCP Tools
+## Config
 
-Common tools exposed to Poke:
+Pokedex stores config in:
 
-- `pokedex_list_workspaces`
-- `pokedex_list_threads`
-- `pokedex_start_task`
-- `pokedex_continue_task`
-- `pokedex_read_thread`
-- `pokedex_get_diff`
-
-Most task tools accept `workspaceAlias`, `prompt`, and optional runtime settings such as `model`, `reasoningEffort`, `verbosity`, `sandbox`, and `approvalPolicy`.
-
-## Development
-
-```bash
-npm install
-npm run lint
-npm run check
-npm test
-npm run build
+```text
+~/.pokedex/config.json
 ```
 
-Generated `dist/` folders and TypeScript build info files are ignored by git.
+The config contains the relay port, relay token, Codex app-server command, default model settings, permissions, and workspace list.
+
+## MCP Tools
+
+Pokedex exposes these tools to Poke:
+
+```text
+pokedex_setup_check
+pokedex_list_workspaces
+pokedex_list_tasks
+pokedex_list_sessions
+pokedex_list_threads
+pokedex_start_task
+pokedex_start_thread
+pokedex_continue_task
+pokedex_send_turn
+pokedex_resume_task
+pokedex_resume_thread
+pokedex_read_thread
+pokedex_fork_thread
+pokedex_set_goal
+pokedex_clear_goal
+pokedex_review
+pokedex_interrupt
+pokedex_get_diff
+pokedex_get_usage
+```
+
+Task and thread tools accept `workspaceAlias`, `prompt`, and optional runtime settings such as `model`, `reasoningEffort`, `verbosity`, `sandbox`, and `approvalPolicy`.
+
+## Troubleshooting
+
+If Poke login does not complete automatically:
+
+```bash
+npx poke@latest login
+```
+
+If Codex needs authentication or setup checks:
+
+```bash
+codex login
+codex doctor
+```
+
+If port `3000` is busy:
+
+```bash
+npx codex-to-poke --port 3010
+```
+
+Inside Pokedex, use `help` for a list of available commands.
 
 ## Platform Support
 
-✅ macOS  
-✅ Linux  
-✅ Windows
+Pokedex supports macOS, Linux, and Windows on Node.js 20 or newer.
 
-Pokedex uses Node.js APIs for paths, process spawning, and home-directory config resolution so the CLI works across platforms.
+## Disclaimer
+
+Pokedex is an independent, unofficial open-source project. It is not affiliated with, endorsed by, sponsored by, or maintained by OpenAI, Poke, The Interaction Company of California Inc., or Interaction. OpenAI, Codex, ChatGPT, Poke, and Interaction names are used only to describe compatibility with their respective products and services.
+
+## Security And Legal
+
+See [LEGAL.md](./LEGAL.md) for trademark and affiliation notes.

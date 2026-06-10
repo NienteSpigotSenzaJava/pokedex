@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { CodexAppServerClient, buildSettings, mapSandboxForAppServer, parseUsage } from "../packages/codex-runner/src/index.js";
-import type { AgentConfig } from "../packages/protocol/src/index.js";
+import { describe, expect, it } from 'vitest';
+import {
+  CodexAppServerClient,
+  buildSettings,
+  mapSandboxForAppServer,
+  parseUsage,
+} from '../packages/codex-runner/src/index.js';
+import type { AgentConfig } from '../packages/protocol/src/index.js';
 
 const fakeServer = `
 const readline = require("node:readline");
@@ -40,78 +45,115 @@ rl.on("line", (line) => {
 `;
 
 const config: AgentConfig = {
-  userId: "user",
-  relayUrl: "ws://localhost:3000/agent",
-  relayToken: "1234567890123456",
+  userId: 'user',
+  relayUrl: 'ws://localhost:3000/agent',
+  relayToken: '1234567890123456',
   appServerCommand: process.execPath,
-  appServerArgs: ["-e", fakeServer],
-  defaultModel: "gpt-5.5",
-  defaultReasoning: "medium",
-  defaultVerbosity: "medium",
-  defaultApprovalPolicy: "on-request",
+  appServerArgs: ['-e', fakeServer],
+  defaultModel: 'gpt-5.5',
+  defaultReasoning: 'medium',
+  defaultVerbosity: 'medium',
+  defaultApprovalPolicy: 'on-request',
   writeTasksEnabled: false,
   fullAccessEnabled: false,
-  workspaces: [{ alias: "repo", root: "/tmp/repo", allowWrite: false, allowFullAccess: false, defaultSandbox: "read_only" }]
+  workspaces: [
+    {
+      alias: 'repo',
+      root: '/tmp/repo',
+      allowWrite: false,
+      allowFullAccess: false,
+      defaultSandbox: 'read_only',
+    },
+  ],
 };
 
-describe("codex app-server client", () => {
-  it("maps sandbox values to app-server config values", () => {
-    expect(mapSandboxForAppServer("workspace_write")).toBe("workspace-write");
+describe('codex app-server client', () => {
+  it('maps sandbox values to app-server config values', () => {
+    expect(mapSandboxForAppServer('workspace_write')).toBe('workspace-write');
   });
 
-  it("builds least-privilege runtime settings", () => {
+  it('builds least-privilege runtime settings', () => {
     expect(buildSettings(config, config.workspaces[0]!, { imagePaths: [] })).toMatchObject({
-      model: "gpt-5.5",
-      sandbox_mode: "read-only",
-      approval_policy: "on-request"
+      model: 'gpt-5.5',
+      sandbox_mode: 'read-only',
+      approval_policy: 'on-request',
     });
   });
 
-  it("parses usage shapes", () => {
-    expect(parseUsage({ usage: { input_tokens: 1, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 4 } })).toEqual({
+  it('parses usage shapes', () => {
+    expect(
+      parseUsage({
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 2,
+          output_tokens: 3,
+          reasoning_output_tokens: 4,
+        },
+      })
+    ).toEqual({
       inputTokens: 1,
       cachedInputTokens: 2,
       outputTokens: 3,
-      reasoningOutputTokens: 4
+      reasoningOutputTokens: 4,
     });
   });
 
-  it("starts native threads and collects streamed events", async () => {
+  it('starts native threads and collects streamed events', async () => {
     const client = new CodexAppServerClient();
     const seen: unknown[] = [];
-    const result = await client.startThread(config, { workspaceAlias: "repo", prompt: "build" }, (event) => seen.push(event));
+    const result = await client.startThread(
+      config,
+      { workspaceAlias: 'repo', prompt: 'build' },
+      (event) => seen.push(event)
+    );
     client.stop();
 
-    expect(result.threadId).toBe("thread-1");
-    expect(result.finalMessage).toBe("done");
+    expect(result.threadId).toBe('thread-1');
+    expect(result.finalMessage).toBe('done');
     expect(result.usage.inputTokens).toBe(2);
     expect(seen.length).toBeGreaterThan(0);
   });
 
-  it("supports list, read, resume, fork, goal, review, and interrupt", async () => {
+  it('supports list, read, resume, fork, goal, review, and interrupt', async () => {
     const client = new CodexAppServerClient();
 
-    await expect(client.listThreads(config, { workspaceAlias: "repo" })).resolves.toMatchObject({ ok: true });
-    await expect(client.readThread(config, { threadId: "thread-1" })).resolves.toMatchObject({ ok: true });
-    await expect(client.resumeThread(config, { threadId: "thread-1", prompt: "next" })).resolves.toMatchObject({ finalMessage: "done" });
-    await expect(client.forkThread(config, { threadId: "thread-1" })).resolves.toMatchObject({ ok: true });
-    await expect(client.setGoal(config, { threadId: "thread-1", goal: "finish" })).resolves.toMatchObject({ ok: true });
-    await expect(client.clearGoal(config, { threadId: "thread-1" })).resolves.toMatchObject({ ok: true });
-    await expect(client.review(config, { workspaceAlias: "repo", threadId: "thread-1" })).resolves.toMatchObject({ finalMessage: "review started" });
-    await expect(client.interrupt(config, { threadId: "thread-1" })).resolves.toMatchObject({ ok: true });
+    await expect(client.listThreads(config, { workspaceAlias: 'repo' })).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(client.readThread(config, { threadId: 'thread-1' })).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(
+      client.resumeThread(config, { threadId: 'thread-1', prompt: 'next' })
+    ).resolves.toMatchObject({ finalMessage: 'done' });
+    await expect(client.forkThread(config, { threadId: 'thread-1' })).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(
+      client.setGoal(config, { threadId: 'thread-1', goal: 'finish' })
+    ).resolves.toMatchObject({ ok: true });
+    await expect(client.clearGoal(config, { threadId: 'thread-1' })).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(
+      client.review(config, { workspaceAlias: 'repo', threadId: 'thread-1' })
+    ).resolves.toMatchObject({ finalMessage: 'review started' });
+    await expect(client.interrupt(config, { threadId: 'thread-1' })).resolves.toMatchObject({
+      ok: true,
+    });
 
     client.stop();
   });
 
-  it("passes explicit skill references to app-server turns", async () => {
+  it('passes explicit skill references to app-server turns', async () => {
     const client = new CodexAppServerClient();
     await expect(
       client.startThread(config, {
-        workspaceAlias: "repo",
-        prompt: "answer short",
-        skills: [{ name: "caveman", path: "/home/user/.agents/skills/caveman/SKILL.md" }]
+        workspaceAlias: 'repo',
+        prompt: 'answer short',
+        skills: [{ name: 'caveman', path: '/home/user/.agents/skills/caveman/SKILL.md' }],
       })
-    ).resolves.toMatchObject({ threadId: "thread-1" });
+    ).resolves.toMatchObject({ threadId: 'thread-1' });
     client.stop();
   });
 });

@@ -1,16 +1,10 @@
 {
   "name": "@pokedex/agent",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "bin": {
-    "pokedex-agent": "dist/index.js"
-  },
-  "files": ["dist", "package.json"],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
@@ -20,7 +14,7 @@
     "@pokedex/codex-runner": "0.1.0",
     "@pokedex/protocol": "0.1.0",
     "@pokedex/security": "0.1.0",
-    "pino": "^9.6.0",
-    "ws": "^8.18.0"
+    "pino": "^10.3.1",
+    "ws": "^8.21.0"
   }
 }

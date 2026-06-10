@@ -1,33 +1,33 @@
-import { timingSafeEqual } from "node:crypto";
-import { isAbsolute, normalize } from "node:path";
-import type { AgentConfig, SandboxMode, Workspace } from "@pokedex/protocol";
+import { timingSafeEqual } from 'node:crypto';
+import { isAbsolute, normalize } from 'node:path';
+import type { AgentConfig, SandboxMode, Workspace } from '@pokedex/protocol';
 
 const secretPatterns = [
   /sk-[a-zA-Z0-9_-]{20,}/g,
   /(?:api[_-]?key|token|secret|password)["'\s:=]+[a-zA-Z0-9_.\-+/=]{8,}/gi,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 ];
 
 export class SecurityError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "SecurityError";
+    this.name = 'SecurityError';
   }
 }
 
 // redact before logs leave local machine or relay audit storage.
 export function redactSecrets(value: unknown): unknown {
-  if (typeof value === "string") {
-    return secretPatterns.reduce((text, pattern) => text.replace(pattern, "[redacted]"), value);
+  if (typeof value === 'string') {
+    return secretPatterns.reduce((text, pattern) => text.replace(pattern, '[redacted]'), value);
   }
 
   if (Array.isArray(value)) return value.map((item) => redactSecrets(item));
 
-  if (value && typeof value === "object") {
+  if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        /token|secret|password|api[_-]?key/i.test(key) ? "[redacted]" : redactSecrets(item)
+        /token|secret|password|api[_-]?key/i.test(key) ? '[redacted]' : redactSecrets(item),
       ])
     );
   }
@@ -43,12 +43,12 @@ export function parseBearer(header: string | undefined): string | null {
 
 export function verifyBearerToken(header: string | undefined, expectedToken: string): void {
   const token = parseBearer(header);
-  if (!token) throw new SecurityError("missing bearer token");
+  if (!token) throw new SecurityError('missing bearer token');
 
   const received = Buffer.from(token);
   const expected = Buffer.from(expectedToken);
   if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
-    throw new SecurityError("invalid bearer token");
+    throw new SecurityError('invalid bearer token');
   }
 }
 
@@ -70,12 +70,15 @@ export function assertSandboxAllowed(
   workspace: Workspace,
   requested: SandboxMode
 ): SandboxMode {
-  if (requested === "danger_full_access" && (!config.fullAccessEnabled || !workspace.allowFullAccess)) {
-    throw new SecurityError("danger_full_access is disabled for this agent or workspace");
+  if (
+    requested === 'danger_full_access' &&
+    (!config.fullAccessEnabled || !workspace.allowFullAccess)
+  ) {
+    throw new SecurityError('danger_full_access is disabled for this agent or workspace');
   }
 
-  if (requested === "workspace_write" && (!config.writeTasksEnabled || !workspace.allowWrite)) {
-    throw new SecurityError("workspace_write is disabled for this agent or workspace");
+  if (requested === 'workspace_write' && (!config.writeTasksEnabled || !workspace.allowWrite)) {
+    throw new SecurityError('workspace_write is disabled for this agent or workspace');
   }
 
   return requested;
