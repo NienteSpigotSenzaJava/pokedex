@@ -34,9 +34,10 @@ else if (command === 'local') await local();
 else die(`unknown command: ${command}`);
 
 async function local() {
-  configPath = defaultConfigPath();
+  configPath = existingConfigPath();
+  const configFileExists = existsSync(configPath);
   config = createConfig(loadSavedConfig());
-  saveConfig();
+  if (!configFileExists || startupConfigOverrides()) saveConfig();
 
   printBanner();
 
@@ -136,7 +137,7 @@ function normalizeWorkspaces(workspaces, defaults) {
   ];
 }
 
-async function startStack() {
+async function startStack({ announceReady = true } = {}) {
   await stopStack(false);
 
   statuses.relay = 'starting';
@@ -151,9 +152,11 @@ async function startStack() {
 
   await startPokeTunnel();
   statuses.poke = 'ok';
-  console.log("✅ Everything's fine, we're ready.\n");
-  console.log('Try saying "is pokedex connected?" to your Poke!\n');
-  console.log('Type "help" for commands. Keep this terminal open while you use Poke.\n');
+  if (announceReady) {
+    console.log("✅ Everything's fine, we're ready.\n");
+    console.log('Try saying "is pokedex connected?" to your Poke!\n');
+    console.log('Type "help" for commands. Keep this terminal open while you use Poke.\n');
+  }
 }
 
 async function startPokeTunnel() {
@@ -276,13 +279,13 @@ async function handleCommand(parts) {
   if (name === 'status') return printStatus();
   if (name === 'config') return printConfig();
   if (name === 'output') return printServiceOutput(subcommand);
-  if (name === 'restart') return await saveAndRestart('restarting stack');
+  if (name === 'restart') return await restartStack();
   if (name === 'write') return await setWrite(subcommand);
   if (name === 'full-access') return await setFullAccess(subcommand);
   if (name === 'workspace') return await handleWorkspaceCommand(subcommand, rest);
   if (name === 'port') return await setPort(subcommand);
   if (name === 'token' && subcommand === 'rotate') return await rotateToken();
-  if (name === 'user-id') return await setScalar('userId', subcommand, 'user id');
+  if (name === 'user-id') return await setScalar('userId', subcommand, 'user id', true);
   if (name === 'model') return await setScalar('defaultModel', subcommand, 'model');
   if (name === 'reasoning')
     return await setEnum('defaultReasoning', subcommand, [
@@ -294,7 +297,7 @@ async function handleCommand(parts) {
     ]);
   if (name === 'verbosity')
     return await setEnum('defaultVerbosity', subcommand, ['low', 'medium', 'high']);
-  if (name === 'approval')
+  if (name === 'approval' || name === 'approve')
     return await setEnum('defaultApprovalPolicy', subcommand, ['untrusted', 'on-request', 'never']);
   if (name === 'codex') return await setCodex([subcommand, ...rest].filter(Boolean));
   throw new Error(`Unknown command: ${name}. Type "help" for commands.`);
@@ -309,7 +312,7 @@ async function setWrite(raw) {
     activeWorkspace().allowFullAccess = false;
   }
   syncWorkspaceSandbox(activeWorkspace());
-  await saveAndRestart(`write ${enabled ? 'on' : 'off'}`);
+  await saveSetting('writeTasksEnabled', enabled ? 'on' : 'off');
 }
 
 async function setFullAccess(raw) {
@@ -319,7 +322,7 @@ async function setFullAccess(raw) {
   activeWorkspace().allowFullAccess = enabled;
   activeWorkspace().allowWrite = enabled || activeWorkspace().allowWrite;
   syncWorkspaceSandbox(activeWorkspace());
-  await saveAndRestart(`full-access ${enabled ? 'on' : 'off'}`);
+  await saveSetting('fullAccessEnabled', enabled ? 'on' : 'off');
 }
 
 async function handleWorkspaceCommand(subcommand, rest) {
@@ -389,24 +392,24 @@ async function setPort(raw) {
   if (!/^\d+$/.test(raw ?? '')) throw new Error('usage: port <number>');
   config.port = String(Number(raw));
   config.relayUrl = `ws://127.0.0.1:${config.port}/agent`;
-  await saveAndRestart(`port ${config.port}`);
+  await saveSetting('port', config.port, true);
 }
 
 async function rotateToken() {
   config.relayToken = randomHex();
-  await saveAndRestart('token rotated');
+  await saveAndRestart('token rotated', true);
 }
 
-async function setScalar(key, raw, label) {
+async function setScalar(key, raw, label, restart = false) {
   if (!raw) throw new Error(`usage: ${label} <value>`);
   config[key] = raw;
-  await saveAndRestart(`${label} ${raw}`);
+  await saveSetting(key, raw, restart);
 }
 
 async function setEnum(key, raw, allowed) {
   if (!allowed.includes(raw)) throw new Error(`allowed values: ${allowed.join(', ')}`);
   config[key] = raw;
-  await saveAndRestart(`${key} ${raw}`);
+  await saveSetting(key, raw);
 }
 
 async function setCodex(parts) {
@@ -418,24 +421,39 @@ async function setCodex(parts) {
   await saveAndRestart(`codex command ${config.appServerCommand}`);
 }
 
-async function saveAndRestart(message) {
-  saveConfig();
-  console.log(`✅ ${message}. Saved.`);
+async function restartStack() {
+  console.log('✅ restarting stack');
   await startStack();
 }
 
+async function saveSetting(setting, value, restart = false) {
+  saveConfig();
+  console.log(`✅ ${setting} set to ${value}`);
+  if (restart) await startStack({ announceReady: false });
+}
+
+async function saveAndRestart(message, restart = false) {
+  saveConfig();
+  console.log(`✅ ${message}`);
+  if (restart) await startStack({ announceReady: false });
+}
+
 function printStatus() {
+  const workspace = activeWorkspace();
   console.log(`relay  ${statusIcon(statuses.relay)} ${statuses.relay}`);
   console.log(`agent  ${statusIcon(statuses.agent)} ${statuses.agent}`);
   console.log(`poke   ${statusIcon(statuses.poke)} ${statuses.poke}`);
   console.log(`mcp    ${mcpHttpUrl()}`);
-  console.log(`mode   ${modeLabel(activeWorkspace())}`);
-  console.log(`space  ${activeWorkspace().alias} -> ${activeWorkspace().root}`);
+  console.log(`active ${workspace.alias} -> ${workspace.root}`);
+  console.log(`access ${modeLabel(workspace)} for active workspace`);
+  console.log(
+    `${config.workspaces.length} ${config.workspaces.length === 1 ? 'workspace' : 'workspaces'} configured`
+  );
   console.log('tip    type "help" for commands');
 }
 
 function printConfig() {
-  console.log(JSON.stringify(redactConfig(config), null, 2));
+  console.log(stringifyConfigJsonc(redactConfig(config)));
 }
 
 function printWorkspaces() {
@@ -603,22 +621,203 @@ async function fetchJson(url) {
 
 function saveConfig() {
   mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  writeFileSync(configPath, stringifyConfigJsonc(config));
 }
 
 function loadSavedConfig() {
-  if (existsSync(configPath)) return readJson(configPath);
+  if (existsSync(configPath)) return readJsonc(configPath);
   return {};
 }
 
-function readJson(path) {
+function readJsonc(path) {
   if (!existsSync(path)) return {};
   try {
-    const state = JSON.parse(readFileSync(path, 'utf8'));
+    const state = parseJsonc(readFileSync(path, 'utf8'));
     return state && typeof state === 'object' ? state : {};
   } catch (error) {
-    die(`invalid json file ${path}: ${error.message}`);
+    die(`invalid jsonc file ${path}: ${error.message}`);
   }
+}
+
+function stringifyConfigJsonc(raw) {
+  const lines = [
+    '{',
+    '  // local relay port used by pokedex and poke.',
+    `  "port": ${quote(raw.port)},`,
+    '',
+    '  // local user id used to pair this agent with the relay.',
+    `  "userId": ${quote(raw.userId)},`,
+    '',
+    '  // websocket url where the local agent connects to the relay.',
+    `  "relayUrl": ${quote(raw.relayUrl)},`,
+    '',
+    '  // random bearer token shared by the relay, agent, and poke tunnel.',
+    `  "relayToken": ${quote(raw.relayToken)},`,
+    '',
+    '  // command used to start the codex app server.',
+    `  "appServerCommand": ${quote(raw.appServerCommand)},`,
+    '',
+    '  // arguments passed to the app server command.',
+    `  "appServerArgs": ${inlineArray(raw.appServerArgs)},`,
+    '',
+    '  // default model used when a poke request does not override it.',
+    `  "defaultModel": ${quote(raw.defaultModel)},`,
+    '',
+    '  // default reasoning effort used when a poke request does not override it.',
+    `  "defaultReasoning": ${quote(raw.defaultReasoning)},`,
+    '',
+    '  // default response verbosity used when a poke request does not override it.',
+    `  "defaultVerbosity": ${quote(raw.defaultVerbosity)},`,
+    '',
+    '  // default approval policy used when a poke request does not override it.',
+    `  "defaultApprovalPolicy": ${quote(raw.defaultApprovalPolicy)},`,
+    '',
+    '  // global write gate; workspace_write also needs allowWrite on the selected workspace.',
+    `  "writeTasksEnabled": ${Boolean(raw.writeTasksEnabled)},`,
+    '',
+    '  // global full-access gate; danger_full_access also needs allowFullAccess on the selected workspace.',
+    `  "fullAccessEnabled": ${Boolean(raw.fullAccessEnabled)},`,
+    '',
+    '  // configured local workspaces that poke can ask codex to use.',
+    '  "workspaces": [',
+    ...configWorkspaceLines(Array.isArray(raw.workspaces) ? raw.workspaces : []),
+    '  ]',
+    '}',
+    '',
+  ];
+  return lines.join('\n');
+}
+
+function configWorkspaceLines(workspaces) {
+  return workspaces.flatMap((workspace, index) => [
+    '    {',
+    '      // short alias used as workspaceAlias in poke requests.',
+    `      "alias": ${quote(workspace.alias)},`,
+    '',
+    '      // absolute folder where codex runs for this workspace.',
+    `      "root": ${quote(workspace.root)},`,
+    '',
+    '      // human-readable label shown when poke lists workspaces.',
+    `      "description": ${quote(workspace.description)},`,
+    '',
+    '      // workspace write gate; workspace_write needs this and writeTasksEnabled.',
+    `      "allowWrite": ${Boolean(workspace.allowWrite)},`,
+    '',
+    '      // workspace full-access gate; danger_full_access needs this and fullAccessEnabled.',
+    `      "allowFullAccess": ${Boolean(workspace.allowFullAccess)},`,
+    '',
+    '      // default sandbox used when a poke request does not choose one.',
+    `      "defaultSandbox": ${quote(workspace.defaultSandbox)}`,
+    `    }${index === workspaces.length - 1 ? '' : ','}`,
+  ]);
+}
+
+function parseJsonc(text) {
+  return JSON.parse(stripJsonc(text));
+}
+
+function stripJsonc(text) {
+  let output = '';
+  let quoteChar = '';
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    const next = text[index + 1] ?? '';
+
+    if (lineComment) {
+      if (char === '\n' || char === '\r') {
+        lineComment = false;
+        output += char;
+      } else output += ' ';
+      continue;
+    }
+
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        output += '  ';
+        index += 1;
+        blockComment = false;
+      } else output += char === '\n' || char === '\r' ? char : ' ';
+      continue;
+    }
+
+    if (quoteChar) {
+      output += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quoteChar) quoteChar = '';
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quoteChar = char;
+      output += char;
+      continue;
+    }
+
+    if (char === '/' && next === '/') {
+      output += '  ';
+      index += 1;
+      lineComment = true;
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      output += '  ';
+      index += 1;
+      blockComment = true;
+      continue;
+    }
+
+    output += char;
+  }
+
+  return removeTrailingCommas(output);
+}
+
+function removeTrailingCommas(text) {
+  let output = '';
+  let quoteChar = '';
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+
+    if (quoteChar) {
+      output += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quoteChar) quoteChar = '';
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quoteChar = char;
+      output += char;
+      continue;
+    }
+
+    if (char === ',') {
+      let nextIndex = index + 1;
+      while (/\s/.test(text[nextIndex] ?? '')) nextIndex += 1;
+      if (['}', ']'].includes(text[nextIndex] ?? '')) continue;
+    }
+
+    output += char;
+  }
+
+  return output;
+}
+
+function quote(value) {
+  return JSON.stringify(value ?? '');
+}
+
+function inlineArray(value) {
+  return `[${(Array.isArray(value) ? value : []).map(quote).join(', ')}]`;
 }
 
 function upsertWorkspace(workspaces, workspace) {
@@ -795,7 +994,35 @@ function npxBin() {
 }
 
 function defaultConfigPath() {
+  return join(homedir(), '.pokedex', 'config.jsonc');
+}
+
+function legacyConfigPath() {
   return join(homedir(), '.pokedex', 'config.json');
+}
+
+function existingConfigPath() {
+  if (existsSync(defaultConfigPath())) return defaultConfigPath();
+  if (existsSync(legacyConfigPath())) return legacyConfigPath();
+  return defaultConfigPath();
+}
+
+function startupConfigOverrides() {
+  return [
+    '--read-only',
+    '--write',
+    '--full-access',
+    '--alias',
+    '--workspace',
+    '--port',
+    '--token',
+    '--codex',
+    '--model',
+    '--reasoning',
+    '--verbosity',
+    '--approval',
+    '--user-id',
+  ].some((flag) => args.includes(flag));
 }
 
 function resolveUserPath(path) {
@@ -850,7 +1077,7 @@ setup
   Poke login opens automatically if needed
 
 config
-  ~/.pokedex/config.json
+  ~/.pokedex/config.jsonc
 
 interactive commands
   status

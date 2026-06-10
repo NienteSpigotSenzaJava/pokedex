@@ -14,14 +14,14 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc -b && npm --workspace codex-to-poke run build",
+    "build": "tsc -b && npm --workspace ./apps/cli run build",
     "check": "tsc -b --pretty false",
     "test": "vitest run",
     "lint": "eslint -f stylish",
     "lint:fix": "eslint --fix -f stylish",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "pack:dry": "npm --workspace codex-to-poke pack --dry-run",
+    "pack:dry": "npm --workspace ./apps/cli pack --dry-run",
     "release:check": "npm run format:check && npm run lint && npm run check && npm test && npm run build && npm audit --workspaces --include-workspace-root && npm run pack:dry"
   },
   "devDependencies": {

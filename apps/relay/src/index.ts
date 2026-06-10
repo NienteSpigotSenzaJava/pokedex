@@ -11,6 +11,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import {
   AgentResponseSchema,
   mcpToolNames,
+  parseJsonc,
   toMcpText,
   type AgentRequest,
   type McpToolName,
@@ -263,9 +264,10 @@ async function callAgent(request: AgentRequest): Promise<ToolResult> {
 
 function relayOptions(): { port: number; token: string; userId: string } {
   const configPath =
-    value('--config') ?? (existsSync(defaultConfigPath()) ? defaultConfigPath() : undefined);
+    value('--config') ??
+    (existsSync(existingDefaultConfigPath()) ? existingDefaultConfigPath() : undefined);
   if (configPath) {
-    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+    const config = parseJsonc(readFileSync(configPath, 'utf8')) as {
       port?: string | number;
       relayToken?: string;
       userId?: string;
@@ -290,7 +292,15 @@ function value(flag: string): string | undefined {
 }
 
 function defaultConfigPath(): string {
+  return join(homedir(), '.pokedex', 'config.jsonc');
+}
+
+function legacyConfigPath(): string {
   return join(homedir(), '.pokedex', 'config.json');
+}
+
+function existingDefaultConfigPath(): string {
+  return existsSync(defaultConfigPath()) ? defaultConfigPath() : legacyConfigPath();
 }
 
 function exitOnListenError(error: Error): void {

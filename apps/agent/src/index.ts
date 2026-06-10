@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import {
   AgentConfigSchema,
   AgentRequestSchema,
+  parseJsonc,
   type AgentConfig,
   type ToolResult,
 } from '@pokedex/protocol';
@@ -14,7 +15,7 @@ import { CodexAppServerClient, capabilitiesResult, diffResult } from '@pokedex/c
 import { redactSecrets } from '@pokedex/security';
 
 const logger = pino({ name: 'pokedex-agent', level: 'warn' });
-const config = loadConfig();
+const configPath = value('--config') ?? existingDefaultConfigPath();
 const codex = new CodexAppServerClient();
 const runtime = {
   reconnectMs: 1000,
@@ -26,12 +27,13 @@ process.once('SIGTERM', shutdown);
 connect();
 
 function loadConfig(): AgentConfig {
-  const path = value('--config') ?? defaultConfigPath();
-  if (!existsSync(path)) throw new Error(`missing config file: ${path}. run pokedex first.`);
-  return AgentConfigSchema.parse(JSON.parse(readFileSync(path, 'utf8')) as unknown);
+  if (!existsSync(configPath))
+    throw new Error(`missing config file: ${configPath}. run pokedex first.`);
+  return AgentConfigSchema.parse(parseJsonc(readFileSync(configPath, 'utf8')));
 }
 
 function connect(): void {
+  const config = loadConfig();
   const url = new URL(config.relayUrl);
   url.searchParams.set('userId', config.userId);
   const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${config.relayToken}` } });
@@ -65,10 +67,11 @@ function connect(): void {
 }
 
 async function dispatch(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  const config = loadConfig();
   logger.info({ toolName, args: redactSecrets(args) }, 'tool call');
 
   if (toolName === 'pokedex_setup_check') return await codex.setupCheck(config);
-  if (toolName === 'pokedex_list_workspaces') return listWorkspaces();
+  if (toolName === 'pokedex_list_workspaces') return listWorkspaces(config);
   if (toolName === 'pokedex_list_tasks') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_sessions') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_threads') return await codex.listThreads(config, args);
@@ -102,22 +105,27 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   };
 }
 
-function listWorkspaces(): ToolResult {
+function listWorkspaces(config: AgentConfig): ToolResult {
   return {
     ok: true,
-    summary: 'configured workspaces loaded.',
+    summary: 'configured workspaces loaded. access is the effective workspace access label.',
     data: {
-      workspaces: config.workspaces.map(
-        ({ alias, description, allowWrite, allowFullAccess, defaultSandbox }) => ({
-          alias,
-          description,
-          allowWrite,
-          allowFullAccess,
-          defaultSandbox,
-        })
-      ),
+      workspaces: config.workspaces.map((workspace) => ({
+        alias: workspace.alias,
+        description: workspace.description,
+        access: workspaceAccess(config, workspace),
+      })),
     },
   };
+}
+
+function workspaceAccess(
+  config: AgentConfig,
+  workspace: AgentConfig['workspaces'][number]
+): string {
+  if (config.fullAccessEnabled && workspace.allowFullAccess) return 'full access';
+  if (config.writeTasksEnabled && workspace.allowWrite) return 'write access';
+  return 'read only';
 }
 
 function runnerResultToTool(
@@ -153,5 +161,13 @@ function value(flag: string): string | undefined {
 }
 
 function defaultConfigPath(): string {
+  return join(homedir(), '.pokedex', 'config.jsonc');
+}
+
+function legacyConfigPath(): string {
   return join(homedir(), '.pokedex', 'config.json');
+}
+
+function existingDefaultConfigPath(): string {
+  return existsSync(defaultConfigPath()) ? defaultConfigPath() : legacyConfigPath();
 }

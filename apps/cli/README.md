@@ -22,4 +22,4 @@ npx codex-to-poke --full-access
 npx codex-to-poke --workspace /path/to/project
 ```
 
-Pokedex stores its config in `~/.pokedex/config.json` and supports Node.js 20 or newer.
+Pokedex stores its JSONC config in `~/.pokedex/config.jsonc` and supports Node.js 20 or newer.

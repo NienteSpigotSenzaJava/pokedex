@@ -12,6 +12,12 @@ Codex App Server -> Pokedex agent -> Pokedex relay -> Poke Tunnel -> Your Poke
 
 ## Usage
 
+1. Add the recipe to Poke
+
+<https://poke.com/r/z-hW49hTZk7>
+
+2. Start Pokedex
+
 ```bash
 npx codex-to-poke
 ```
@@ -94,10 +100,10 @@ quit
 Pokedex stores config in:
 
 ```text
-~/.pokedex/config.json
+~/.pokedex/config.jsonc
 ```
 
-The config contains the relay port, relay token, Codex app-server command, default model settings, permissions, and workspace list.
+The JSONC config contains the relay port, random relay token, Codex app-server command, default model settings, permissions, and workspace list.
 
 ## MCP Tools
 

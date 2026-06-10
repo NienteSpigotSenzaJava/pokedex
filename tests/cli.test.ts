@@ -12,6 +12,7 @@ describe('pokedex cli', () => {
 
     expect(output).toContain('Poke login opens automatically if needed');
     expect(output).toContain('pokedex help');
+    expect(output).toContain('~/.pokedex/config.jsonc');
     expect(output).toContain('output [relay|agent|poke]');
   });
 
@@ -27,5 +28,48 @@ describe('pokedex cli', () => {
     ]) {
       expect(source).not.toContain(text);
     }
+  });
+
+  it('confirms saved settings without replaying startup guidance', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('console.log(`✅ ${setting} set to ${value}`);');
+    expect(source).toContain('if (restart) await startStack({ announceReady: false });');
+    expect(source).not.toContain('console.log(`✅ ${message}. Saved.`);');
+  });
+
+  it('writes commented jsonc with inline app-server args', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('function stringifyConfigJsonc');
+    expect(source).toContain('global write gate; workspace_write also needs allowWrite');
+    expect(source).toContain('workspace full-access gate; danger_full_access needs this');
+    expect(source).toContain('`  "appServerArgs": ${inlineArray(raw.appServerArgs)},`');
+  });
+
+  it('labels status workspace output as active among configured workspaces', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('console.log(`active ${workspace.alias} -> ${workspace.root}`);');
+    expect(source).toContain(
+      "`${config.workspaces.length} ${config.workspaces.length === 1 ? 'workspace' : 'workspaces'} configured`"
+    );
+    expect(source).not.toContain('console.log(`spaces ${config.workspaces.length}');
+    expect(source).not.toContain('console.log(`space  ${activeWorkspace().alias}');
+  });
+
+  it('does not rewrite an existing config just by starting pokedex', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('if (!configFileExists || startupConfigOverrides()) saveConfig();');
+    expect(source).not.toContain('config = createConfig(loadSavedConfig());\n  saveConfig();');
+  });
+
+  it('keeps normal config edits live without restarting the mcp stack', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain("if (name === 'approval' || name === 'approve')");
+    expect(source).toContain('await saveSetting(key, raw);');
+    expect(source).toContain("await saveSetting('port', config.port, true);");
   });
 });

@@ -3,6 +3,7 @@ import {
   AgentConfigSchema,
   ThreadStartSchema,
   mcpToolNames,
+  parseJsonc,
   stableCapabilities,
 } from '../packages/protocol/src/index.js';
 import { mcpToolDefinitions, toolSpecs } from '../apps/relay/src/tools.js';
@@ -18,6 +19,27 @@ describe('protocol schemas', () => {
 
     expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
     expect(parsed.workspaces[0]?.defaultSandbox).toBe('read_only');
+  });
+
+  it('parses jsonc agent config with comments and trailing commas', () => {
+    const parsed = AgentConfigSchema.parse(
+      parseJsonc(`{
+        // local agent identity.
+        "userId": "user",
+        "relayUrl": "ws://localhost:3000/agent",
+        "relayToken": "1234567890123456",
+        "appServerArgs": ["app-server", "--listen", "stdio://"],
+        "workspaces": [
+          {
+            "alias": "repo",
+            "root": "/tmp/repo",
+          },
+        ],
+      }`)
+    );
+
+    expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
+    expect(parsed.workspaces[0]?.alias).toBe('repo');
   });
 
   it('rejects empty first turns', () => {

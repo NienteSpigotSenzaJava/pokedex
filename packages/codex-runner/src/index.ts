@@ -90,6 +90,7 @@ export class CodexAppServerClient {
   private child: AppServerProcess | null = null;
   private initialized = false;
   private initializing: Promise<void> | null = null;
+  private commandKey = '';
   private nextId = 1;
   private buffer = '';
   private stderr = '';
@@ -340,6 +341,7 @@ export class CodexAppServerClient {
     }
     this.child?.kill();
     this.child = null;
+    this.commandKey = '';
     this.initialized = false;
     this.initializing = null;
   }
@@ -363,27 +365,35 @@ export class CodexAppServerClient {
   }
 
   private ensureStarted(config: AgentConfig): void {
+    const commandKey = JSON.stringify([config.appServerCommand, config.appServerArgs]);
+    if (this.child && !this.child.killed && this.commandKey !== commandKey) this.stop();
     if (this.child && !this.child.killed) return;
 
     this.initialized = false;
     this.initializing = null;
+    this.commandKey = commandKey;
     this.buffer = '';
     this.stderr = '';
-    this.child = spawn(config.appServerCommand, config.appServerArgs, {
+    const child = spawn(config.appServerCommand, config.appServerArgs, {
       cwd: process.cwd(),
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    this.child.stdout.setEncoding('utf8');
-    this.child.stderr.setEncoding('utf8');
-    this.child.stdout.on('data', (chunk: string) => this.handleStdout(chunk));
-    this.child.stderr.on('data', (chunk: string) => {
+    this.child = child;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => this.handleStdout(chunk));
+    child.stderr.on('data', (chunk: string) => {
       this.stderr += chunk;
     });
-    this.child.on('error', (error) => this.failAll(error));
-    this.child.on('close', () => {
+    child.on('error', (error) => {
+      if (this.child === child) this.failAll(error);
+    });
+    child.on('close', () => {
+      if (this.child !== child) return;
       this.failAll(new Error(formatAppServerStop(this.stderr)));
       this.child = null;
+      this.commandKey = '';
       this.initialized = false;
       this.initializing = null;
     });

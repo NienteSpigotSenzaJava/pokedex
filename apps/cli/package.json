@@ -4,6 +4,11 @@
   "description": "Unofficial local Poke to Codex bridge.",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NienteSpigotSenzaJava/pokedex.git",
+    "directory": "apps/cli"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -26,7 +31,7 @@
     "package.json"
   ],
   "publishConfig": {
-    "access": "public"
+    "registry": "https://npm.pkg.github.com"
   },
   "scripts": {
     "build": "node scripts/build.mjs",

@@ -44,6 +44,30 @@ rl.on("line", (line) => {
 });
 `;
 
+function fakeServerForMessage(finalMessage: string): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "thread/start") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-1" } } }));
+    if (msg.method === "turn/start") console.log(JSON.stringify({ id: msg.id, result: { finalMessage: ${JSON.stringify(
+      finalMessage
+    )}, usage: { input_tokens: 2 } } }));
+  });
+  `;
+}
+
 const config: AgentConfig = {
   userId: 'user',
   relayUrl: 'ws://localhost:3000/agent',
@@ -154,6 +178,24 @@ describe('codex app-server client', () => {
         skills: [{ name: 'caveman', path: '/home/user/.agents/skills/caveman/SKILL.md' }],
       })
     ).resolves.toMatchObject({ threadId: 'thread-1' });
+    client.stop();
+  });
+
+  it('restarts app-server when command args change', async () => {
+    const client = new CodexAppServerClient();
+    const first = { ...config, appServerArgs: ['-e', fakeServerForMessage('first')] };
+    const second = { ...config, appServerArgs: ['-e', fakeServerForMessage('second')] };
+
+    await expect(
+      client.startThread(first, { workspaceAlias: 'repo', prompt: 'one' })
+    ).resolves.toMatchObject({
+      finalMessage: 'first',
+    });
+    await expect(
+      client.startThread(second, { workspaceAlias: 'repo', prompt: 'two' })
+    ).resolves.toMatchObject({
+      finalMessage: 'second',
+    });
     client.stop();
   });
 });
