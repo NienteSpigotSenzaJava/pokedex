@@ -183,10 +183,11 @@ export class CodexAppServerClient {
           { type: 'text', text: task.prompt },
         ],
         settings: stripUndefined({
-          model: task.model,
+          model: task.model ?? config.defaultModel,
           profile: task.profile,
-          model_reasoning_effort: task.reasoningEffort,
-          model_verbosity: task.verbosity,
+          model_reasoning_effort: task.reasoningEffort ?? config.defaultReasoning,
+          model_verbosity: task.verbosity ?? config.defaultVerbosity,
+          approval_policy: task.approvalPolicy ?? config.defaultApprovalPolicy,
           web_search: task.webSearch,
         }),
       });

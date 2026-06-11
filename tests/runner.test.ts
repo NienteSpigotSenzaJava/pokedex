@@ -68,6 +68,35 @@ function fakeServerForMessage(finalMessage: string): string {
   `;
 }
 
+function fakeServerForTurnSettings(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          finalMessage: msg.params.settings.approval_policy,
+          usage: { input_tokens: 1 }
+        }
+      }));
+    }
+  });
+  `;
+}
+
 const config: AgentConfig = {
   userId: 'user',
   relayUrl: 'ws://localhost:3000/agent',
@@ -102,6 +131,25 @@ describe('codex app-server client', () => {
       sandbox_mode: 'read-only',
       approval_policy: 'on-request',
     });
+  });
+
+  it('passes changed default approval to later mcp turns without restarting app-server', async () => {
+    const client = new CodexAppServerClient();
+    const appServerArgs = ['-e', fakeServerForTurnSettings()];
+
+    await expect(
+      client.startTurn(
+        { ...config, appServerArgs, defaultApprovalPolicy: 'on-request' },
+        { threadId: 'thread-1', prompt: 'first' }
+      )
+    ).resolves.toMatchObject({ finalMessage: 'on-request' });
+    await expect(
+      client.startTurn(
+        { ...config, appServerArgs, defaultApprovalPolicy: 'never' },
+        { threadId: 'thread-1', prompt: 'second' }
+      )
+    ).resolves.toMatchObject({ finalMessage: 'never' });
+    client.stop();
   });
 
   it('parses usage shapes', () => {
