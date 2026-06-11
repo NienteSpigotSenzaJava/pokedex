@@ -27,20 +27,19 @@ const interactiveCommands = [
   ['status', 'show relay, agent, poke, workspace, and access status'],
   ['config', 'print the saved config with secrets hidden'],
   ['output [relay|agent|poke]', 'show recent logs for one service or all services'],
-  ['write [on|off]', 'toggle write permission for the active workspace'],
-  ['full-access [on|off]', 'toggle full filesystem access for the active workspace'],
+  ['write <on|off>', 'set write permission for the active workspace'],
+  ['full-access <on|off>', 'set full filesystem access for the active workspace'],
   ['workspace list', 'show configured workspaces'],
   ['workspace add <alias> <path> [description]', 'add or update a workspace'],
   ['workspace remove <alias>', 'remove a workspace'],
   ['workspace use <alias>', 'make a workspace active and restart services'],
   ['workspace describe <alias> <description>', 'change a workspace description'],
-  ['workspace write <alias> [on|off]', 'toggle write permission for one workspace'],
-  ['workspace full-access <alias> [on|off]', 'toggle full access for one workspace'],
+  ['workspace write <alias> <on|off>', 'set write permission for one workspace'],
+  ['workspace full-access <alias> <on|off>', 'set full access for one workspace'],
   ['model <name>', 'set the default Codex model'],
   ['reasoning minimal|low|medium|high|xhigh', 'set the default reasoning effort'],
   ['verbosity low|medium|high', 'set the default answer verbosity'],
   ['approval untrusted|on-request|never', 'set the default approval policy'],
-  ['codex <command> [app-server args...]', 'change the Codex command Pokedex starts'],
   ['port <number>', 'change the local relay port and restart services'],
   ['token rotate', 'create a new relay token and restart services'],
   ['restart', 'restart relay, agent, and poke'],
@@ -78,37 +77,45 @@ async function local() {
 
 function createConfig(saved) {
   const first = firstWorkspace(saved);
+  const alias = value('--alias') ?? first.alias ?? 'main';
+  const existing = rawWorkspace(saved, alias);
+  const accessOverride = hasAccessOverride();
+  const root = value('--workspace')
+    ? resolveUserPath(value('--workspace'))
+    : existing?.root
+      ? String(existing.root)
+      : (first.root ?? resolveUserPath('.'));
   const readOnly = has('--read-only');
-  const writeEnabled = readOnly
-    ? false
-    : has('--write') || has('--full-access')
-      ? true
-      : (saved.writeTasksEnabled ?? first.allowWrite ?? false);
   const fullAccess = readOnly
     ? false
     : has('--full-access')
       ? true
       : has('--write')
         ? false
-        : (saved.fullAccessEnabled ?? first.allowFullAccess ?? false);
-  const alias = value('--alias') ?? first.alias ?? 'main';
-  const root = value('--workspace')
-    ? resolveUserPath(value('--workspace'))
-    : (first.root ?? resolveUserPath('.'));
+        : Boolean(saved.fullAccessEnabled || existing?.allowFullAccess || first.allowFullAccess);
+  const writeEnabled = readOnly
+    ? false
+    : has('--write') || has('--full-access')
+      ? true
+      : Boolean(saved.writeTasksEnabled || fullAccess || existing?.allowWrite || first.allowWrite);
   const workspaces = normalizeWorkspaces(saved.workspaces, {
     alias,
     root,
     writeEnabled,
     fullAccess,
   });
+  const workspaceWrite = accessOverride ? writeEnabled : (existing?.allowWrite ?? writeEnabled);
+  const workspaceFullAccess = accessOverride
+    ? fullAccess
+    : (existing?.allowFullAccess ?? fullAccess);
 
   upsertWorkspace(workspaces, {
     alias,
     root,
-    description: first.description ?? `${alias} workspace`,
-    allowWrite: writeEnabled,
-    allowFullAccess: fullAccess,
-    defaultSandbox: sandboxFor(writeEnabled, fullAccess),
+    description: existing?.description ? String(existing.description) : `${alias} workspace`,
+    allowWrite: workspaceWrite,
+    allowFullAccess: workspaceFullAccess,
+    defaultSandbox: sandboxFor(workspaceWrite, workspaceFullAccess),
   });
 
   return {
@@ -163,6 +170,7 @@ function normalizeWorkspaces(workspaces, defaults) {
 
 async function startStack({ announceReady = true } = {}) {
   await stopStack(false);
+  await ensureCodexReady();
 
   statuses.relay = 'starting';
   spawnManaged('relay', 'pokedex-relay', [
@@ -217,14 +225,44 @@ function spawnPokeTunnel() {
 }
 
 async function runPokeLogin() {
-  console.log('Poke is not logged in. Starting `npx poke@latest login`...\n');
-  const code = await runInteractive(npxBin(), ['poke@latest', 'login']);
+  const code = await runInteractive(npxBin(), ['poke@latest', 'login'], 'Poke login');
   if (code !== 0)
     throw new Error('Poke login did not complete. Run `npx poke@latest login` and retry.');
-  console.log('\nPoke login finished. Starting the tunnel again...\n');
 }
 
-function runInteractive(command, commandArgs) {
+async function ensureCodexReady() {
+  if (config.appServerCommand !== 'codex') return;
+  if (!commandExists(config.appServerCommand)) await installCodexCli();
+}
+
+async function installCodexCli() {
+  console.log('Codex CLI missing. Installing `@openai/codex` with npm...\n');
+  const code = await runInteractive(
+    npmBin(),
+    ['install', '-g', '@openai/codex@latest'],
+    'Codex install'
+  );
+  if (code !== 0)
+    throw new Error(
+      'Codex CLI install failed. Install it with `npm install -g @openai/codex@latest`, then retry.'
+    );
+  if (!commandExists(config.appServerCommand))
+    throw new Error(
+      'Codex CLI installed, but `codex` is still not on PATH. Open a new terminal or install it with `npm install -g @openai/codex@latest`.'
+    );
+}
+
+function commandExists(command) {
+  const result = spawnSync(command, ['--version'], {
+    cwd: invocationCwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, npm_config_update_notifier: 'false' },
+  });
+  return !result.error;
+}
+
+function runInteractive(command, commandArgs, label) {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, commandArgs, {
       cwd: invocationCwd,
@@ -233,7 +271,7 @@ function runInteractive(command, commandArgs) {
     });
     child.on('error', rejectRun);
     child.on('exit', (code, signal) => {
-      if (signal) rejectRun(new Error(`Poke login stopped by ${signal}.`));
+      if (signal) rejectRun(new Error(`${label} stopped by ${signal}.`));
       else resolveRun(code ?? 0);
     });
   });
@@ -339,12 +377,11 @@ async function handleCommand(parts) {
     return await setEnum('defaultVerbosity', subcommand, ['low', 'medium', 'high']);
   if (name === 'approval' || name === 'approve')
     return await setEnum('defaultApprovalPolicy', subcommand, ['untrusted', 'on-request', 'never']);
-  if (name === 'codex') return await setCodex([subcommand, ...rest].filter(Boolean));
   throw new Error(`Unknown command: ${name}. Type "help" for commands.`);
 }
 
 async function setWrite(raw) {
-  const enabled = parseOnOff(raw, !config.writeTasksEnabled);
+  const enabled = parseOnOff(raw, 'write <on|off>');
   config.writeTasksEnabled = enabled;
   activeWorkspace().allowWrite = enabled;
   if (!enabled) {
@@ -356,7 +393,7 @@ async function setWrite(raw) {
 }
 
 async function setFullAccess(raw) {
-  const enabled = parseOnOff(raw, !config.fullAccessEnabled);
+  const enabled = parseOnOff(raw, 'full-access <on|off>');
   config.fullAccessEnabled = enabled;
   config.writeTasksEnabled = enabled || config.writeTasksEnabled;
   activeWorkspace().allowFullAccess = enabled;
@@ -415,9 +452,15 @@ async function describeWorkspace(alias, description) {
 }
 
 async function setWorkspaceAccess(alias, key, raw) {
+  const usage =
+    key === 'allowWrite'
+      ? 'workspace write <alias> <on|off>'
+      : 'workspace full-access <alias> <on|off>';
+  if (!alias || !raw) throw new Error(`usage: ${usage}`);
   assertAlias(alias);
   const workspace = findWorkspace(alias);
-  workspace[key] = parseOnOff(raw, !workspace[key]);
+  workspace[key] = parseOnOff(raw, usage);
+  if (key === 'allowWrite' && workspace[key]) config.writeTasksEnabled = true;
   if (key === 'allowFullAccess' && workspace[key]) {
     workspace.allowWrite = true;
     config.writeTasksEnabled = true;
@@ -450,15 +493,6 @@ async function setEnum(key, raw, allowed) {
   if (!allowed.includes(raw)) throw new Error(`allowed values: ${allowed.join(', ')}`);
   config[key] = raw;
   await saveSetting(key, raw);
-}
-
-async function setCodex(parts) {
-  if (!parts.length) throw new Error('usage: codex <command> [app-server args...]');
-  config.appServerCommand = parts[0];
-  config.appServerArgs = parts.slice(1).length
-    ? parts.slice(1)
-    : ['app-server', '--listen', 'stdio://'];
-  await saveAndRestart(`codex command ${config.appServerCommand}`);
 }
 
 async function restartStack() {
@@ -518,11 +552,7 @@ function printServiceOutput(name) {
 
 function printInteractiveHelp() {
   console.log(`pokedex commands
-${formatCommandHelp(interactiveCommands)}
-
-setup
-  codex login
-  Poke login opens automatically if needed`);
+${formatCommandHelp(interactiveCommands)}`);
 }
 
 function spawnManaged(name, bin, binArgs) {
@@ -879,6 +909,17 @@ function firstWorkspace(raw) {
   return Array.isArray(raw.workspaces) && raw.workspaces[0] ? raw.workspaces[0] : {};
 }
 
+function rawWorkspace(raw, alias) {
+  if (!Array.isArray(raw.workspaces)) return undefined;
+  return raw.workspaces.find(
+    (workspace) => workspace && typeof workspace === 'object' && workspace.alias === alias
+  );
+}
+
+function hasAccessOverride() {
+  return ['--read-only', '--write', '--full-access'].some((flag) => args.includes(flag));
+}
+
 function activeWorkspace() {
   return config.workspaces[0];
 }
@@ -921,7 +962,7 @@ function serviceTitle(name) {
 
 function serviceHint(name, detail) {
   if (name === 'poke') return 'Run `npx poke@latest login`, then start Pokedex again.';
-  if (name === 'agent') return 'Run `codex login` and `codex doctor`, then start Pokedex again.';
+  if (name === 'agent') return 'Type `output agent` to inspect Codex app-server output.';
   if (name === 'relay')
     return 'Check the port with `pokedex --port <number>`, then start Pokedex again.';
   return detail;
@@ -944,8 +985,8 @@ function formatCommandHelp(commands) {
   return commands.map(([name, description]) => `  ${name.padEnd(width)}${description}`).join('\n');
 }
 
-function parseOnOff(raw, defaultValue) {
-  if (!raw) return defaultValue;
+function parseOnOff(raw, usage) {
+  if (!raw) throw new Error(`usage: ${usage}`);
   if (['on', 'true', 'yes', '1'].includes(raw)) return true;
   if (['off', 'false', 'no', '0'].includes(raw)) return false;
   throw new Error('use on or off');
@@ -1126,10 +1167,6 @@ Local Poke to Codex bridge.
 usage
   pokedex [--workspace .] [--port 3000] [--write] [--read-only]
   pokedex help
-
-setup
-  codex login
-  Poke login opens automatically if needed
 
 config
   ~/.pokedex/config.jsonc

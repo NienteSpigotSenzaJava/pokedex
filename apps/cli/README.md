@@ -5,11 +5,8 @@ Unofficial local Poke to Codex bridge.
 Pokedex is an independent open-source project. It is not affiliated with, endorsed by, sponsored by, or maintained by OpenAI, Poke, The Interaction Company of California Inc., or Interaction.
 
 ```bash
-codex login
 npx codex-to-poke
 ```
-
-Pokedex starts the Poke login flow automatically if the tunnel needs it.
 
 Keep the terminal open while using Poke. When the prompt opens, type `help` to see commands.
 

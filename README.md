@@ -22,15 +22,7 @@ Codex App Server -> Pokedex agent -> Pokedex relay -> Poke Tunnel -> Your Poke
 npx codex-to-poke
 ```
 
-## Setup
-
-Authenticate Codex before starting Pokedex. Pokedex starts the Poke login flow automatically if the tunnel needs it.
-
-```bash
-codex login
-```
-
-Then start Pokedex in the workspace you want Codex to see:
+Start Pokedex in the workspace you want Codex to see:
 
 ```bash
 cd /path/to/project
@@ -75,20 +67,19 @@ restart
 status
 config
 output [relay|agent|poke]
-write [on|off]
-full-access [on|off]
+write <on|off>
+full-access <on|off>
 workspace list
 workspace add <alias> <path> [description]
 workspace remove <alias>
 workspace use <alias>
 workspace describe <alias> <description>
-workspace write <alias> [on|off]
-workspace full-access <alias> [on|off]
+workspace write <alias> <on|off>
+workspace full-access <alias> <on|off>
 model <name>
 reasoning minimal|low|medium|high|xhigh
 verbosity low|medium|high
 approval untrusted|on-request|never
-codex <command> [app-server args...]
 port <number>
 token rotate
 restart
@@ -150,11 +141,10 @@ If Poke login does not complete automatically:
 npx poke@latest login
 ```
 
-If Codex needs authentication or setup checks:
+If Codex cannot be found:
 
 ```bash
-codex login
-codex doctor
+npm install -g @openai/codex@latest
 ```
 
 If port `3000` is busy:

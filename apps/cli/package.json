@@ -1,6 +1,6 @@
 {
   "name": "codex-to-poke",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Unofficial local Poke to Codex bridge.",
   "license": "MIT",
   "type": "module",
