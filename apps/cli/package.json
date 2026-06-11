@@ -1,14 +1,9 @@
 {
   "name": "codex-to-poke",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Unofficial local Poke to Codex bridge.",
   "license": "MIT",
   "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/NienteSpigotSenzaJava/pokedex.git",
-    "directory": "apps/cli"
-  },
   "engines": {
     "node": ">=20"
   },
