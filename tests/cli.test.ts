@@ -14,6 +14,29 @@ describe('pokedex cli', () => {
     expect(output).toContain('pokedex help');
     expect(output).toContain('~/.pokedex/config.jsonc');
     expect(output).toContain('output [relay|agent|poke]');
+    expect(output).toContain('show recent logs for one service or all services');
+    expect(output).toContain('workspace add <alias> <path> [description]');
+    expect(output).toContain('add or update a workspace');
+  });
+
+  it('does not duplicate help guidance for errors that already include it', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('if (message.includes(\'Type "help" for commands.\'))');
+    expect(source).toContain(
+      'throw new Error(`Unknown command: ${name}. Type "help" for commands.`);'
+    );
+  });
+
+  it('defaults approval policy to never for poke compatibility', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain(
+      "defaultApprovalPolicy: value('--approval') ?? saved.defaultApprovalPolicy ?? 'never'"
+    );
+    expect(source).not.toContain(
+      "defaultApprovalPolicy: value('--approval') ?? saved.defaultApprovalPolicy ?? 'on-request'"
+    );
   });
 
   it('keeps terminal-facing failure text friendly', () => {
@@ -33,7 +56,7 @@ describe('pokedex cli', () => {
   it('confirms saved settings without replaying startup guidance', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain('console.log(`✅ ${setting} set to ${value}`);');
+    expect(source).toContain('console.log(`✅ ${setting} set to ${value}.`);');
     expect(source).toContain('if (restart) await startStack({ announceReady: false });');
     expect(source).not.toContain('console.log(`✅ ${message}. Saved.`);');
   });
@@ -42,6 +65,8 @@ describe('pokedex cli', () => {
     const source = readFileSync(cliPath, 'utf8');
 
     expect(source).toContain('function stringifyConfigJsonc');
+    expect(source).toContain('function advancedConfigLines');
+    expect(source).toContain('optional relay port override');
     expect(source).toContain('global write gate; workspace_write also needs allowWrite');
     expect(source).toContain('workspace full-access gate; danger_full_access needs this');
     expect(source).toContain('`  "appServerArgs": ${inlineArray(raw.appServerArgs)},`');

@@ -97,6 +97,115 @@ function fakeServerForTurnSettings(): string {
   `;
 }
 
+function fakeServerForApproval(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  let pendingTurnId = null;
+  let lastDecision = null;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      pendingTurnId = msg.id;
+      console.log(JSON.stringify({
+        id: "approval-request-1",
+        method: "item/commandExecution/requestApproval",
+        params: {
+          itemId: "item-1",
+          threadId: msg.params.threadId,
+          turnId: "turn-1",
+          reason: "needs shell",
+          command: ["npm", "test"],
+          cwd: "/tmp/repo",
+          availableDecisions: ["accept", "acceptForSession", "decline", "cancel"]
+        }
+      }));
+      return;
+    }
+    if (msg.id === "approval-request-1") {
+      lastDecision = msg.result;
+      console.log(JSON.stringify({
+        method: "serverRequest/resolved",
+        params: { requestId: "approval-request-1", threadId: "thread-1" }
+      }));
+      console.log(JSON.stringify({
+        id: pendingTurnId,
+        result: { finalMessage: "approved with " + lastDecision, usage: { input_tokens: 3 } }
+      }));
+      return;
+    }
+    if (msg.method === "thread/list") {
+      console.log(JSON.stringify({ id: msg.id, result: { lastDecision } }));
+    }
+  });
+  `;
+}
+
+function fakeServerForSkills(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "skills/list") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          data: [{
+            cwd: msg.params.cwds[0],
+            skills: [
+              {
+                name: "caveman",
+                path: "/home/user/.agents/skills/caveman/SKILL.md",
+                description: "brief mode",
+                enabled: true
+              },
+              {
+                name: "2d-games",
+                path: "/home/user/.agents/skills/game-development/2d-games/SKILL.md",
+                description: "2d game principles",
+                enabled: true
+              }
+            ],
+            errors: []
+          }]
+        }
+      }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          finalMessage: msg.params.input.map((item) => item.type === "skill" ? item.name + ":" + item.path : item.text).join("|"),
+          usage: { input_tokens: 1 }
+        }
+      }));
+    }
+  });
+  `;
+}
+
 const config: AgentConfig = {
   userId: 'user',
   relayUrl: 'ws://localhost:3000/agent',
@@ -106,7 +215,7 @@ const config: AgentConfig = {
   defaultModel: 'gpt-5.5',
   defaultReasoning: 'medium',
   defaultVerbosity: 'medium',
-  defaultApprovalPolicy: 'on-request',
+  defaultApprovalPolicy: 'never',
   writeTasksEnabled: false,
   fullAccessEnabled: false,
   workspaces: [
@@ -129,7 +238,7 @@ describe('codex app-server client', () => {
     expect(buildSettings(config, config.workspaces[0]!, { imagePaths: [] })).toMatchObject({
       model: 'gpt-5.5',
       sandbox_mode: 'read-only',
-      approval_policy: 'on-request',
+      approval_policy: 'never',
     });
   });
 
@@ -149,6 +258,68 @@ describe('codex app-server client', () => {
         { threadId: 'thread-1', prompt: 'second' }
       )
     ).resolves.toMatchObject({ finalMessage: 'never' });
+    client.stop();
+  });
+
+  it('lists and resolves app-server approval requests', async () => {
+    const client = new CodexAppServerClient();
+    const approvalConfig = { ...config, appServerArgs: ['-e', fakeServerForApproval()] };
+
+    await expect(
+      client.startTurn(approvalConfig, { threadId: 'thread-1', prompt: 'run tests' })
+    ).resolves.toMatchObject({
+      finalMessage: expect.stringContaining('approval-1'),
+    });
+
+    await expect(client.listApprovals()).resolves.toMatchObject({
+      ok: true,
+      data: {
+        approvals: [
+          expect.objectContaining({
+            approvalId: 'approval-1',
+            commandText: 'npm test',
+            cwd: '/tmp/repo',
+          }),
+        ],
+      },
+    });
+    await expect(client.approve({ forSession: true })).resolves.toMatchObject({
+      ok: true,
+      data: { decision: 'acceptForSession' },
+    });
+    await expect(client.listApprovals()).resolves.toMatchObject({
+      data: { approvals: [] },
+    });
+    await expect(client.listThreads(approvalConfig, {})).resolves.toMatchObject({
+      data: { result: { lastDecision: 'acceptForSession' } },
+    });
+    client.stop();
+  });
+
+  it('lists local skills and injects skill input items by name', async () => {
+    const client = new CodexAppServerClient();
+    const skillConfig = { ...config, appServerArgs: ['-e', fakeServerForSkills()] };
+
+    await expect(client.listSkills(skillConfig, {})).resolves.toMatchObject({
+      ok: true,
+      data: {
+        skills: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'caveman',
+            path: '/home/user/.agents/skills/caveman/SKILL.md',
+          }),
+        ]),
+      },
+    });
+    await expect(
+      client.startTurn(skillConfig, {
+        threadId: 'thread-1',
+        prompt: '$caveman answer',
+        skillNames: ['2d-games'],
+      })
+    ).resolves.toMatchObject({
+      finalMessage: expect.stringContaining('caveman:/home/user/.agents/skills/caveman/SKILL.md'),
+    });
     client.stop();
   });
 

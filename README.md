@@ -103,7 +103,7 @@ Pokedex stores config in:
 ~/.pokedex/config.jsonc
 ```
 
-The JSONC config contains the relay port, random relay token, Codex app-server command, default model settings, permissions, and workspace list.
+The JSONC config contains the random relay token, default model settings, permissions, and workspace list. Default local wiring such as port `3000`, user `local`, and `codex app-server --listen stdio://` is kept internal unless you override it.
 
 ## MCP Tools
 
@@ -115,6 +115,7 @@ pokedex_list_workspaces
 pokedex_list_tasks
 pokedex_list_sessions
 pokedex_list_threads
+pokedex_list_skills
 pokedex_start_task
 pokedex_start_thread
 pokedex_continue_task
@@ -127,11 +128,19 @@ pokedex_set_goal
 pokedex_clear_goal
 pokedex_review
 pokedex_interrupt
+pokedex_list_approvals
+pokedex_approve
+pokedex_decline
+pokedex_cancel_approval
 pokedex_get_diff
 pokedex_get_usage
 ```
 
-Task and thread tools accept `workspaceAlias`, `prompt`, and optional runtime settings such as `model`, `reasoningEffort`, `verbosity`, `sandbox`, and `approvalPolicy`.
+Task and thread tools accept `workspaceAlias`, `prompt`, and optional runtime settings such as `model`, `reasoningEffort`, `verbosity`, `sandbox`, `approvalPolicy`, `skillNames`, and `skills`.
+
+Use `pokedex_list_skills` to fetch local skills from Codex, including `~/.agents/skills` and `~/.codex/skills`. You can pass `skillNames: ["caveman"]` or include `$caveman` in the prompt; Pokedex resolves the path and sends a skill input item to Codex.
+
+If Codex pauses for approval, ask Poke to list approvals, then approve or decline the pending request. When only one approval is pending, `pokedex_approve` and `pokedex_decline` do not need an `approvalId`.
 
 ## Troubleshooting
 

@@ -23,6 +23,30 @@ const bannerText = [
   '██▄█▀ ██▀██ ██▄█▀ ██▄▄  ██▀██ ██▄▄  ▀█▄█▀ ',
   '██    ▀███▀ ██ ██ ██▄▄▄ ████▀ ██▄▄▄ ██ ██ ',
 ].join('\n');
+const interactiveCommands = [
+  ['status', 'show relay, agent, poke, workspace, and access status'],
+  ['config', 'print the saved config with secrets hidden'],
+  ['output [relay|agent|poke]', 'show recent logs for one service or all services'],
+  ['write [on|off]', 'toggle write permission for the active workspace'],
+  ['full-access [on|off]', 'toggle full filesystem access for the active workspace'],
+  ['workspace list', 'show configured workspaces'],
+  ['workspace add <alias> <path> [description]', 'add or update a workspace'],
+  ['workspace remove <alias>', 'remove a workspace'],
+  ['workspace use <alias>', 'make a workspace active and restart services'],
+  ['workspace describe <alias> <description>', 'change a workspace description'],
+  ['workspace write <alias> [on|off]', 'toggle write permission for one workspace'],
+  ['workspace full-access <alias> [on|off]', 'toggle full access for one workspace'],
+  ['model <name>', 'set the default Codex model'],
+  ['reasoning minimal|low|medium|high|xhigh', 'set the default reasoning effort'],
+  ['verbosity low|medium|high', 'set the default answer verbosity'],
+  ['approval untrusted|on-request|never', 'set the default approval policy'],
+  ['codex <command> [app-server args...]', 'change the Codex command Pokedex starts'],
+  ['port <number>', 'change the local relay port and restart services'],
+  ['token rotate', 'create a new relay token and restart services'],
+  ['restart', 'restart relay, agent, and poke'],
+  ['help', 'show this command list'],
+  ['quit', 'stop Pokedex and close the prompt'],
+];
 let configPath = '';
 let config = {};
 let readline = null;
@@ -99,7 +123,7 @@ function createConfig(saved) {
     defaultModel: value('--model') ?? saved.defaultModel ?? 'gpt-5.5',
     defaultReasoning: value('--reasoning') ?? saved.defaultReasoning ?? 'medium',
     defaultVerbosity: value('--verbosity') ?? saved.defaultVerbosity ?? 'medium',
-    defaultApprovalPolicy: value('--approval') ?? saved.defaultApprovalPolicy ?? 'on-request',
+    defaultApprovalPolicy: value('--approval') ?? saved.defaultApprovalPolicy ?? 'never',
     writeTasksEnabled: writeEnabled,
     fullAccessEnabled: fullAccess,
     workspaces,
@@ -141,12 +165,28 @@ async function startStack({ announceReady = true } = {}) {
   await stopStack(false);
 
   statuses.relay = 'starting';
-  spawnManaged('relay', 'pokedex-relay', ['--config', configPath]);
+  spawnManaged('relay', 'pokedex-relay', [
+    '--config',
+    configPath,
+    '--port',
+    config.port,
+    '--token',
+    config.relayToken,
+    '--user-id',
+    config.userId,
+  ]);
   await waitForRelay();
   statuses.relay = 'ok';
 
   statuses.agent = 'starting';
-  spawnManaged('agent', 'pokedex-agent', ['--config', configPath]);
+  spawnManaged('agent', 'pokedex-agent', [
+    '--config',
+    configPath,
+    '--relay-url',
+    config.relayUrl,
+    '--user-id',
+    config.userId,
+  ]);
   await waitForAgent();
   statuses.agent = 'ok';
 
@@ -428,7 +468,7 @@ async function restartStack() {
 
 async function saveSetting(setting, value, restart = false) {
   saveConfig();
-  console.log(`✅ ${setting} set to ${value}`);
+  console.log(`✅ ${setting} set to ${value}.`);
   if (restart) await startStack({ announceReady: false });
 }
 
@@ -478,27 +518,7 @@ function printServiceOutput(name) {
 
 function printInteractiveHelp() {
   console.log(`pokedex commands
-  status
-  config
-  output [relay|agent|poke]
-  write [on|off]
-  full-access [on|off]
-  workspace list
-  workspace add <alias> <path> [description]
-  workspace remove <alias>
-  workspace use <alias>
-  workspace describe <alias> <description>
-  workspace write <alias> [on|off]
-  workspace full-access <alias> [on|off]
-  model <name>
-  reasoning minimal|low|medium|high|xhigh
-  verbosity low|medium|high
-  approval untrusted|on-request|never
-  codex <command> [app-server args...]
-  port <number>
-  token rotate
-  restart
-  quit
+${formatCommandHelp(interactiveCommands)}
 
 setup
   codex login
@@ -642,23 +662,9 @@ function readJsonc(path) {
 function stringifyConfigJsonc(raw) {
   const lines = [
     '{',
-    '  // local relay port used by pokedex and poke.',
-    `  "port": ${quote(raw.port)},`,
-    '',
-    '  // local user id used to pair this agent with the relay.',
-    `  "userId": ${quote(raw.userId)},`,
-    '',
-    '  // websocket url where the local agent connects to the relay.',
-    `  "relayUrl": ${quote(raw.relayUrl)},`,
-    '',
+    ...advancedConfigLines(raw),
     '  // random bearer token shared by the relay, agent, and poke tunnel.',
     `  "relayToken": ${quote(raw.relayToken)},`,
-    '',
-    '  // command used to start the codex app server.',
-    `  "appServerCommand": ${quote(raw.appServerCommand)},`,
-    '',
-    '  // arguments passed to the app server command.',
-    `  "appServerArgs": ${inlineArray(raw.appServerArgs)},`,
     '',
     '  // default model used when a poke request does not override it.',
     `  "defaultModel": ${quote(raw.defaultModel)},`,
@@ -686,6 +692,41 @@ function stringifyConfigJsonc(raw) {
     '',
   ];
   return lines.join('\n');
+}
+
+function advancedConfigLines(raw) {
+  const lines = [];
+  const defaultRelayUrl = `ws://127.0.0.1:${raw.port ?? '3000'}/agent`;
+  addAdvancedConfigLine(lines, raw.port !== '3000', [
+    '  // optional relay port override. omit this for the default 3000.',
+    `  "port": ${quote(raw.port)},`,
+  ]);
+  addAdvancedConfigLine(lines, raw.userId !== 'local', [
+    '  // optional local user id override used to pair this agent with the relay.',
+    `  "userId": ${quote(raw.userId)},`,
+  ]);
+  addAdvancedConfigLine(lines, raw.relayUrl !== defaultRelayUrl, [
+    '  // optional websocket url override where the local agent connects to the relay.',
+    `  "relayUrl": ${quote(raw.relayUrl)},`,
+  ]);
+  addAdvancedConfigLine(lines, raw.appServerCommand !== 'codex', [
+    '  // optional command override used to start the codex app server.',
+    `  "appServerCommand": ${quote(raw.appServerCommand)},`,
+  ]);
+  addAdvancedConfigLine(
+    lines,
+    !sameArray(raw.appServerArgs, ['app-server', '--listen', 'stdio://']),
+    [
+      '  // optional arguments override passed to the app server command.',
+      `  "appServerArgs": ${inlineArray(raw.appServerArgs)},`,
+    ]
+  );
+  return lines;
+}
+
+function addAdvancedConfigLine(lines, include, section) {
+  if (!include) return;
+  lines.push(...section, '');
 }
 
 function configWorkspaceLines(workspaces) {
@@ -820,6 +861,14 @@ function inlineArray(value) {
   return `[${(Array.isArray(value) ? value : []).map(quote).join(', ')}]`;
 }
 
+function sameArray(left, right) {
+  return (
+    Array.isArray(left) &&
+    left.length === right.length &&
+    left.every((item, index) => item === right[index])
+  );
+}
+
 function upsertWorkspace(workspaces, workspace) {
   const existing = workspaces.findIndex((item) => item.alias === workspace.alias);
   if (existing === -1) workspaces.unshift(workspace);
@@ -886,7 +935,13 @@ function cleanServiceLine(name, line) {
 function formatError(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (message.startsWith('⚠️') || message.startsWith('✅')) return message;
+  if (message.includes('Type "help" for commands.')) return `⚠️ ${message}`;
   return `⚠️ ${message}\nType "help" for commands.`;
+}
+
+function formatCommandHelp(commands) {
+  const width = Math.max(...commands.map(([name]) => name.length)) + 2;
+  return commands.map(([name, description]) => `  ${name.padEnd(width)}${description}`).join('\n');
 }
 
 function parseOnOff(raw, defaultValue) {
@@ -1080,14 +1135,7 @@ config
   ~/.pokedex/config.jsonc
 
 interactive commands
-  status
-  output [relay|agent|poke]
-  write on
-  workspace add repo ./repo
-  model gpt-5.5
-  restart
-  help
-  quit
+${formatCommandHelp(interactiveCommands)}
 
 common
   npx codex-to-poke

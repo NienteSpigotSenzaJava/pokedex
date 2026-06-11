@@ -17,8 +17,22 @@ describe('protocol schemas', () => {
       workspaces: [{ alias: 'repo', root: '/tmp/repo' }],
     });
 
+    expect(parsed.userId).toBe('user');
+    expect(parsed.relayUrl).toBe('ws://localhost:3000/agent');
     expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
     expect(parsed.workspaces[0]?.defaultSandbox).toBe('read_only');
+  });
+
+  it('defaults derived local config fields when the saved config omits them', () => {
+    const parsed = AgentConfigSchema.parse({
+      relayToken: '1234567890123456',
+      workspaces: [{ alias: 'repo', root: '/tmp/repo' }],
+    });
+
+    expect(parsed.userId).toBe('local');
+    expect(parsed.relayUrl).toBe('ws://127.0.0.1:3000/agent');
+    expect(parsed.appServerCommand).toBe('codex');
+    expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
   });
 
   it('parses jsonc agent config with comments and trailing commas', () => {
@@ -62,6 +76,8 @@ describe('protocol schemas', () => {
     const tools = mcpToolDefinitions();
     expect(tools.length).toBe(mcpToolNames.length);
     expect(tools.some((tool) => tool.name === 'pokedex_start_task')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_list_skills')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_approve')).toBe(true);
     expect(tools.every((tool) => tool.inputSchema && typeof tool.inputSchema === 'object')).toBe(
       true
     );

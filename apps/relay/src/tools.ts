@@ -10,6 +10,8 @@ type ToolSpec = {
 
 const empty = z.object({});
 const threadId = z.object({ threadId: z.string().min(1) });
+const approvalTarget = z.object({ approvalId: z.string().min(1).optional() });
+const approvalApprove = approvalTarget.extend({ forSession: z.boolean().optional() });
 const runtime = {
   model: z.string().optional(),
   profile: z.string().optional(),
@@ -19,9 +21,14 @@ const runtime = {
   approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).optional(),
   webSearch: z.enum(['cached', 'live', 'disabled']).optional(),
   imagePaths: z.array(z.string()).optional(),
+  skillNames: z.array(z.string().min(1)).optional(),
   skills: z.array(z.object({ name: z.string().min(1), path: z.string().min(1) })).optional(),
 };
 const workspace = z.object({ workspaceAlias: z.string().min(1) });
+const skillList = z.object({
+  workspaceAlias: z.string().optional(),
+  forceReload: z.boolean().optional(),
+});
 const startThread = z.object({
   workspaceAlias: z.string().min(1),
   prompt: z.string().min(1),
@@ -31,6 +38,7 @@ const startThread = z.object({
 const turn = z.object({
   threadId: z.string().min(1),
   prompt: z.string().min(1),
+  workspaceAlias: z.string().optional(),
   ...runtime,
 });
 const listThreads = z.object({
@@ -72,6 +80,13 @@ export const toolSpecs: ToolSpec[] = [
     description:
       'list native local codex threads from app-server, optionally filtered by workspace.',
     inputSchema: listThreads,
+  },
+  {
+    name: 'pokedex_list_skills',
+    title: 'list skills',
+    description:
+      'list local codex skills available to a workspace, including ~/.agents/skills and ~/.codex/skills.',
+    inputSchema: skillList,
   },
   {
     name: 'pokedex_start_task',
@@ -149,6 +164,33 @@ export const toolSpecs: ToolSpec[] = [
     title: 'interrupt',
     description: 'interrupt the active turn for a native local codex thread.',
     inputSchema: threadId,
+  },
+  {
+    name: 'pokedex_list_approvals',
+    title: 'list approvals',
+    description: 'list codex approvals waiting for a decision from poke.',
+    inputSchema: empty,
+  },
+  {
+    name: 'pokedex_approve',
+    title: 'approve',
+    description:
+      'approve a pending codex command or file-change request. omit approvalId when only one is pending.',
+    inputSchema: approvalApprove,
+  },
+  {
+    name: 'pokedex_decline',
+    title: 'decline',
+    description:
+      'decline a pending codex command or file-change request. omit approvalId when only one is pending.',
+    inputSchema: approvalTarget,
+  },
+  {
+    name: 'pokedex_cancel_approval',
+    title: 'cancel approval',
+    description:
+      'cancel a pending codex command or file-change request. omit approvalId when only one is pending.',
+    inputSchema: approvalTarget,
   },
   {
     name: 'pokedex_get_diff',

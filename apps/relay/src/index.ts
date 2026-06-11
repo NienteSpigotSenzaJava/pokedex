@@ -39,7 +39,7 @@ const pending = new Map<
 >();
 const mcpToolNameSet = new Set<string>(mcpToolNames);
 const protocolVersion = '2025-11-25';
-const agentResponseTimeoutMs = 120_000;
+const agentResponseTimeoutMs = 600_000;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(pinoHttp({ logger }));
@@ -273,9 +273,9 @@ function relayOptions(): { port: number; token: string; userId: string } {
       userId?: string;
     };
     return {
-      port: Number(config.port ?? 3000),
-      token: config.relayToken ?? randomBytes(32).toString('hex'),
-      userId: config.userId ?? 'local',
+      port: Number(value('--port') ?? config.port ?? 3000),
+      token: value('--token') ?? config.relayToken ?? randomBytes(32).toString('hex'),
+      userId: value('--user-id') ?? config.userId ?? 'local',
     };
   }
 

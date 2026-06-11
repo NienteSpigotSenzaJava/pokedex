@@ -9,6 +9,9 @@ describe('pokedex agent config loading', () => {
     const source = readFileSync(agentPath, 'utf8');
 
     expect(source).toContain('const configPath = value');
+    expect(source).toContain("value('--relay-url') ?? saved.relayUrl");
+    expect(source).toContain('void codex.warm(config).catch');
+    expect(source).toContain("if (toolName === 'pokedex_list_skills')");
     expect(source).toContain(
       'async function dispatch(toolName: string, args: Record<string, unknown>)'
     );

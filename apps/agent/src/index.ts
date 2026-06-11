@@ -29,7 +29,13 @@ connect();
 function loadConfig(): AgentConfig {
   if (!existsSync(configPath))
     throw new Error(`missing config file: ${configPath}. run pokedex first.`);
-  return AgentConfigSchema.parse(parseJsonc(readFileSync(configPath, 'utf8')));
+  const raw = parseJsonc(readFileSync(configPath, 'utf8'));
+  const saved = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  return AgentConfigSchema.parse({
+    ...saved,
+    userId: value('--user-id') ?? saved.userId,
+    relayUrl: value('--relay-url') ?? saved.relayUrl,
+  });
 }
 
 function connect(): void {
@@ -43,6 +49,9 @@ function connect(): void {
     opened = true;
     runtime.reconnectMs = 1000;
     logger.info({ relayUrl: config.relayUrl }, 'connected to relay');
+    void codex.warm(config).catch((error: unknown) => {
+      logger.warn({ err: redactSecrets(error) }, 'codex warm-up failed');
+    });
   });
   socket.on('close', () => {
     const wait = runtime.reconnectMs;
@@ -75,6 +84,7 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_list_tasks') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_sessions') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_threads') return await codex.listThreads(config, args);
+  if (toolName === 'pokedex_list_skills') return await codex.listSkills(config, args);
   if (toolName === 'pokedex_start_task')
     return runnerResultToTool('codex task started.', await codex.startThread(config, args));
   if (toolName === 'pokedex_start_thread')
@@ -94,6 +104,10 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_review')
     return runnerResultToTool('codex review started.', await codex.review(config, args));
   if (toolName === 'pokedex_interrupt') return await codex.interrupt(config, args);
+  if (toolName === 'pokedex_list_approvals') return await codex.listApprovals();
+  if (toolName === 'pokedex_approve') return await codex.approve(args);
+  if (toolName === 'pokedex_decline') return await codex.decline(args);
+  if (toolName === 'pokedex_cancel_approval') return await codex.cancelApproval(args);
   if (toolName === 'pokedex_get_diff') return await diffResult(config, args);
   if (toolName === 'pokedex_get_usage')
     return runtime.lastUsage ?? { ok: false, summary: 'no usage seen yet.', data: {} };

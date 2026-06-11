@@ -38,15 +38,15 @@ export const WorkspaceSchema = z.object({
 });
 
 export const AgentConfigSchema = z.object({
-  userId: z.string().min(1),
-  relayUrl: z.string().url(),
+  userId: z.string().min(1).default('local'),
+  relayUrl: z.string().url().default('ws://127.0.0.1:3000/agent'),
   relayToken: z.string().min(16),
   appServerCommand: z.string().min(1).default('codex'),
   appServerArgs: z.array(z.string()).default(['app-server', '--listen', 'stdio://']),
   defaultModel: z.string().default('gpt-5.5'),
   defaultReasoning: ReasoningEffortSchema.default('medium'),
   defaultVerbosity: VerbositySchema.default('medium'),
-  defaultApprovalPolicy: ApprovalPolicySchema.default('on-request'),
+  defaultApprovalPolicy: ApprovalPolicySchema.default('never'),
   writeTasksEnabled: z.boolean().default(false),
   fullAccessEnabled: z.boolean().default(false),
   workspaces: z.array(WorkspaceSchema).min(1),
@@ -65,6 +65,7 @@ export const RuntimeSettingsSchema = z.object({
   approvalPolicy: ApprovalPolicySchema.optional(),
   webSearch: WebSearchModeSchema.optional(),
   imagePaths: z.array(z.string()).default([]),
+  skillNames: z.array(z.string().min(1)).default([]),
   skills: z.array(z.object({ name: z.string().min(1), path: z.string().min(1) })).default([]),
 });
 
@@ -77,10 +78,19 @@ export const ThreadStartSchema = RuntimeSettingsSchema.extend({
 export const TurnStartSchema = RuntimeSettingsSchema.extend({
   threadId: z.string().min(1),
   prompt: z.string().min(1),
+  workspaceAlias: z.string().optional(),
 });
 
 export const ThreadIdSchema = z.object({
   threadId: z.string().min(1),
+});
+
+export const ApprovalTargetSchema = z.object({
+  approvalId: z.string().min(1).optional(),
+});
+
+export const ApprovalApproveSchema = ApprovalTargetSchema.extend({
+  forSession: z.boolean().default(false),
 });
 
 export const ThreadReadSchema = ThreadIdSchema.extend({
@@ -109,11 +119,19 @@ export const WorkspaceRequestSchema = z.object({
   workspaceAlias: z.string().min(1),
 });
 
+export const SkillListSchema = z.object({
+  workspaceAlias: z.string().optional(),
+  forceReload: z.boolean().default(false),
+});
+
 export type ThreadStart = z.infer<typeof ThreadStartSchema>;
 export type TurnStart = z.infer<typeof TurnStartSchema>;
 export type ThreadList = z.infer<typeof ThreadListSchema>;
 export type GoalSet = z.infer<typeof GoalSetSchema>;
 export type ReviewStart = z.infer<typeof ReviewStartSchema>;
+export type ApprovalTarget = z.infer<typeof ApprovalTargetSchema>;
+export type ApprovalApprove = z.infer<typeof ApprovalApproveSchema>;
+export type SkillList = z.infer<typeof SkillListSchema>;
 
 export const ToolResultSchema = z.object({
   ok: z.boolean(),
@@ -145,6 +163,7 @@ export const mcpToolNames = [
   'pokedex_list_tasks',
   'pokedex_list_sessions',
   'pokedex_list_threads',
+  'pokedex_list_skills',
   'pokedex_start_task',
   'pokedex_start_thread',
   'pokedex_continue_task',
@@ -157,6 +176,10 @@ export const mcpToolNames = [
   'pokedex_clear_goal',
   'pokedex_review',
   'pokedex_interrupt',
+  'pokedex_list_approvals',
+  'pokedex_approve',
+  'pokedex_decline',
+  'pokedex_cancel_approval',
   'pokedex_get_diff',
   'pokedex_get_usage',
 ] as const;
@@ -199,6 +222,18 @@ export const stableCapabilities: Capability[] = [
     name: 'review',
     level: 'stable',
     reason: 'review/start runs codex reviewer on a native thread',
+    source: 'app_server',
+  },
+  {
+    name: 'approvals',
+    level: 'stable',
+    reason: 'app-server approval requests can be listed and answered from poke',
+    source: 'app_server',
+  },
+  {
+    name: 'skills',
+    level: 'stable',
+    reason: 'app-server skills/list exposes local codex and agents skills',
     source: 'app_server',
   },
   {

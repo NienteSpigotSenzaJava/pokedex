@@ -1,17 +1,25 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import type {
+  ApprovalApprove,
+  ApprovalTarget,
   AgentConfig,
   GoalSet,
   ReviewStart,
   RuntimeSettingsSchema,
+  SkillList,
   ToolResult,
   Usage,
   Workspace,
 } from '@pokedex/protocol';
 import {
+  ApprovalApproveSchema,
+  ApprovalTargetSchema,
   GoalSetSchema,
   ReviewStartSchema,
+  SkillListSchema,
   ThreadIdSchema,
   ThreadListSchema,
   ThreadReadSchema,
@@ -31,12 +39,38 @@ import {
 
 type AppServerProcess = ChildProcessByStdio<Writable, Readable, Readable>;
 type JsonRecord = Record<string, unknown>;
+type RpcId = string | number;
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
 };
 type RuntimeSettings = ReturnType<typeof RuntimeSettingsSchema.parse>;
+type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
+type PendingApproval = {
+  approvalId: string;
+  requestId: RpcId;
+  kind: 'command' | 'file';
+  method: string;
+  createdAt: string;
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
+  reason?: string;
+  command?: string[];
+  commandText?: string;
+  cwd?: string;
+  grantRoot?: string;
+  availableDecisions?: string[];
+  raw: unknown;
+};
+type SkillReference = { name: string; path: string };
+type ListedSkill = SkillReference & {
+  description?: string;
+  enabled?: boolean;
+  source?: string;
+  cwd?: string;
+};
 
 export type AppServerEvent = {
   method?: string;
@@ -94,7 +128,10 @@ export class CodexAppServerClient {
   private nextId = 1;
   private buffer = '';
   private stderr = '';
+  private nextApprovalId = 1;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly approvals = new Map<string, PendingApproval>();
+  private readonly threadCwds = new Map<string, string>();
   private readonly events: unknown[] = [];
   private readonly listeners = new Set<(event: AppServerEvent) => void>();
 
@@ -124,6 +161,11 @@ export class CodexAppServerClient {
     });
   }
 
+  async warm(config: AgentConfig): Promise<void> {
+    this.ensureStarted(config);
+    await this.ensureInitialized();
+  }
+
   async listThreads(config: AgentConfig, input: unknown): Promise<ToolResult> {
     const args = ThreadListSchema.parse(input);
     const params: JsonRecord = {
@@ -137,6 +179,24 @@ export class CodexAppServerClient {
 
     const result = await this.request(config, 'thread/list', stripUndefined(params));
     return { ok: true, summary: 'codex local threads loaded.', data: { result } };
+  }
+
+  async listSkills(config: AgentConfig, input: unknown): Promise<ToolResult> {
+    const args = SkillListSchema.parse(input) satisfies SkillList;
+    const workspace = args.workspaceAlias
+      ? findWorkspace(config, args.workspaceAlias)
+      : config.workspaces[0];
+    if (!workspace) throw new Error('no workspace configured');
+    const cwd = resolveWorkspaceRoot(workspace);
+    const result = await this.skillsListForCwd(config, cwd, args.forceReload);
+    const skills = normalizeSkills(result, cwd);
+    return {
+      ok: true,
+      summary: skills.length
+        ? `${skills.length} codex skill${skills.length === 1 ? '' : 's'} available.`
+        : 'no codex skills found.',
+      data: { cwd, skillRoots: defaultSkillRoots(), skills, result },
+    };
   }
 
   async startThread(
@@ -159,6 +219,7 @@ export class CodexAppServerClient {
       );
       const threadId = extractThreadId(started);
       if (!threadId) throw new Error('codex app-server did not return a thread id');
+      this.threadCwds.set(threadId, cwd);
       const turn = await this.startTurn(config, { ...task, threadId }, onProgress);
       return { ...turn, threadId, events: [...events, ...turn.events] };
     } finally {
@@ -172,25 +233,43 @@ export class CodexAppServerClient {
     onProgress?: (progress: RunnerProgress) => void
   ): Promise<RunnerResult> {
     const task = TurnStartSchema.parse(input);
+    const cwd = this.cwdForTurn(config, task.threadId, task.workspaceAlias);
+    const skills = await this.resolveTurnSkills(config, cwd, task);
     const events: unknown[] = [];
     const off = this.collect(events, onProgress, task.threadId);
 
     try {
-      const result = await this.request(config, 'turn/start', {
-        threadId: task.threadId,
-        input: [
-          ...task.skills.map(({ name, path }) => ({ type: 'skill', name, path })),
-          { type: 'text', text: task.prompt },
-        ],
-        settings: stripUndefined({
-          model: task.model ?? config.defaultModel,
-          profile: task.profile,
-          model_reasoning_effort: task.reasoningEffort ?? config.defaultReasoning,
-          model_verbosity: task.verbosity ?? config.defaultVerbosity,
-          approval_policy: task.approvalPolicy ?? config.defaultApprovalPolicy,
-          web_search: task.webSearch,
-        }),
-      });
+      const outcome = await this.requestWithApprovalYield(
+        config,
+        'turn/start',
+        {
+          threadId: task.threadId,
+          input: [
+            ...skills.map(({ name, path }) => ({ type: 'skill', name, path })),
+            { type: 'text', text: task.prompt },
+          ],
+          settings: stripUndefined({
+            model: task.model ?? config.defaultModel,
+            profile: task.profile,
+            model_reasoning_effort: task.reasoningEffort ?? config.defaultReasoning,
+            model_verbosity: task.verbosity ?? config.defaultVerbosity,
+            approval_policy: task.approvalPolicy ?? config.defaultApprovalPolicy,
+            web_search: task.webSearch,
+          }),
+        },
+        task.threadId
+      );
+
+      if (outcome.approval) {
+        return {
+          threadId: task.threadId,
+          finalMessage: approvalWaitMessage(outcome.approval),
+          usage: UsageSchema.parse({}),
+          events,
+        };
+      }
+
+      const result = outcome.result;
 
       return {
         threadId: task.threadId,
@@ -267,7 +346,23 @@ export class CodexAppServerClient {
     const off = this.collect(events, onProgress, threadId);
 
     try {
-      const result = await this.request(config, 'review/start', { threadId });
+      const outcome = await this.requestWithApprovalYield(
+        config,
+        'review/start',
+        { threadId },
+        threadId
+      );
+
+      if (outcome.approval) {
+        return {
+          threadId,
+          finalMessage: approvalWaitMessage(outcome.approval),
+          usage: UsageSchema.parse({}),
+          events,
+        };
+      }
+
+      const result = outcome.result;
       return {
         threadId,
         finalMessage: extractFinalMessage(result) || 'review started.',
@@ -285,6 +380,32 @@ export class CodexAppServerClient {
     return { ok: true, summary: `thread ${args.threadId} interrupted.`, data: { result } };
   }
 
+  async listApprovals(): Promise<ToolResult> {
+    const approvals = this.approvalList();
+    return {
+      ok: true,
+      summary: approvals.length
+        ? `${approvals.length} pending codex approval${approvals.length === 1 ? '' : 's'}.`
+        : 'no pending codex approvals.',
+      data: { approvals },
+    };
+  }
+
+  async approve(input: unknown): Promise<ToolResult> {
+    const args = ApprovalApproveSchema.parse(input) satisfies ApprovalApprove;
+    return this.resolveApproval(args.approvalId, args.forSession ? 'acceptForSession' : 'accept');
+  }
+
+  async decline(input: unknown): Promise<ToolResult> {
+    const args = ApprovalTargetSchema.parse(input) satisfies ApprovalTarget;
+    return this.resolveApproval(args.approvalId, 'decline');
+  }
+
+  async cancelApproval(input: unknown): Promise<ToolResult> {
+    const args = ApprovalTargetSchema.parse(input) satisfies ApprovalTarget;
+    return this.resolveApproval(args.approvalId, 'cancel');
+  }
+
   async request(
     config: AgentConfig,
     method: string,
@@ -294,6 +415,39 @@ export class CodexAppServerClient {
     this.ensureStarted(config);
     if (method !== 'initialize') await this.ensureInitialized();
     return await this.sendRequest(method, params, timeoutMs);
+  }
+
+  private async requestWithApprovalYield(
+    config: AgentConfig,
+    method: string,
+    params: unknown,
+    threadId?: string,
+    timeoutMs = 120_000
+  ): Promise<{ result?: unknown; approval?: PendingApproval }> {
+    let stopWaiting = (): void => {};
+    const approvalPromise = new Promise<PendingApproval>((resolve) => {
+      const existing = this.findApprovalForThread(threadId);
+      if (existing) {
+        resolve(existing);
+        return;
+      }
+      stopWaiting = this.onEvent((event) => {
+        const approval = this.approvalFromEvent(event);
+        if (!approval || !approvalMatchesThread(approval, threadId)) return;
+        stopWaiting();
+        resolve(approval);
+      });
+    });
+    const requestPromise = this.request(config, method, params, timeoutMs);
+    requestPromise.catch(() => undefined);
+    try {
+      return await Promise.race([
+        requestPromise.then((result) => ({ result })),
+        approvalPromise.then((approval) => ({ approval })),
+      ]);
+    } finally {
+      stopWaiting();
+    }
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -334,6 +488,12 @@ export class CodexAppServerClient {
     });
   }
 
+  private sendResponse(id: RpcId, result: unknown): void {
+    const child = this.child;
+    if (!child) throw new Error('codex app-server is not running');
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
+  }
+
   stop(): void {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timeout);
@@ -341,6 +501,7 @@ export class CodexAppServerClient {
       this.pending.delete(id);
     }
     this.child?.kill();
+    this.approvals.clear();
     this.child = null;
     this.commandKey = '';
     this.initialized = false;
@@ -363,6 +524,172 @@ export class CodexAppServerClient {
       if (usage) progress.usage = usage;
       onProgress?.(progress);
     });
+  }
+
+  private approvalList(): unknown[] {
+    return [...this.approvals.values()].map((approval) => redactSecrets(publicApproval(approval)));
+  }
+
+  private cwdForTurn(
+    config: AgentConfig,
+    threadId: string,
+    workspaceAlias: string | undefined
+  ): string {
+    if (workspaceAlias) {
+      const cwd = resolveWorkspaceRoot(findWorkspace(config, workspaceAlias));
+      this.threadCwds.set(threadId, cwd);
+      return cwd;
+    }
+    const cached = this.threadCwds.get(threadId);
+    if (cached) return cached;
+    const workspace = config.workspaces[0];
+    if (!workspace) throw new Error('no workspace configured');
+    return resolveWorkspaceRoot(workspace);
+  }
+
+  private async resolveTurnSkills(
+    config: AgentConfig,
+    cwd: string,
+    task: RuntimeSettings & { prompt: string }
+  ): Promise<SkillReference[]> {
+    const explicit = [...task.skills, ...linkedSkillsFromPrompt(task.prompt)];
+    const explicitNames = [...new Set(task.skillNames)].filter(
+      (name) => !explicit.some((skill) => skill.name === name)
+    );
+    const markerNames = [...new Set(skillMarkersFromPrompt(task.prompt))].filter(
+      (name) => !explicitNames.includes(name) && !explicit.some((skill) => skill.name === name)
+    );
+    if (!explicitNames.length && !markerNames.length) return uniqueSkills(explicit);
+
+    const listed = normalizeSkills(await this.skillsListForCwd(config, cwd, false), cwd);
+    const explicitResolved = explicitNames.map((name) => resolveSkillName(name, listed));
+    const missing = explicitResolved
+      .map((skill, index) => (skill ? '' : explicitNames[index]))
+      .filter((name): name is string => Boolean(name));
+    if (missing.length) {
+      throw new Error(
+        `unknown skill${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}. use pokedex_list_skills.`
+      );
+    }
+    const markerResolved = markerNames
+      .map((name) => resolveSkillName(name, listed))
+      .filter((skill): skill is SkillReference => Boolean(skill));
+    return uniqueSkills([
+      ...explicit,
+      ...(explicitResolved.filter(Boolean) as SkillReference[]),
+      ...markerResolved,
+    ]);
+  }
+
+  private async skillsListForCwd(
+    config: AgentConfig,
+    cwd: string,
+    forceReload: boolean
+  ): Promise<unknown> {
+    return await this.request(
+      config,
+      'skills/list',
+      {
+        cwds: [cwd],
+        forceReload,
+        perCwdExtraUserRoots: [{ cwd, extraUserRoots: defaultSkillRoots() }],
+      },
+      30_000
+    );
+  }
+
+  private resolveApproval(approvalId: string | undefined, decision: ApprovalDecision): ToolResult {
+    const approval = this.findApproval(approvalId);
+    if (!approval) {
+      const approvals = this.approvalList();
+      return {
+        ok: false,
+        summary: approvals.length
+          ? 'choose an approvalId because more than one codex approval is pending.'
+          : 'no pending codex approval.',
+        data: { approvals },
+      };
+    }
+
+    if (approval.availableDecisions?.length && !approval.availableDecisions.includes(decision)) {
+      return {
+        ok: false,
+        summary: `${decision} is not available for approval ${approval.approvalId}.`,
+        data: { approval: redactSecrets(publicApproval(approval)) },
+      };
+    }
+
+    this.sendResponse(approval.requestId, decision);
+    this.approvals.delete(approval.approvalId);
+    return {
+      ok: true,
+      summary: `codex approval ${decision} sent.`,
+      data: { approval: redactSecrets(publicApproval(approval)), decision },
+    };
+  }
+
+  private findApproval(approvalId: string | undefined): PendingApproval | null {
+    if (approvalId) return this.approvals.get(approvalId) ?? null;
+    return this.approvals.size === 1 ? [...this.approvals.values()][0]! : null;
+  }
+
+  private findApprovalForThread(threadId: string | undefined): PendingApproval | null {
+    return (
+      [...this.approvals.values()].find((approval) => approvalMatchesThread(approval, threadId)) ??
+      null
+    );
+  }
+
+  private approvalFromEvent(event: AppServerEvent): PendingApproval | null {
+    const raw = asRecord(event.raw);
+    const requestId = raw.id;
+    if (!isRpcId(requestId)) return null;
+    return (
+      [...this.approvals.values()].find((approval) => approval.requestId === requestId) ?? null
+    );
+  }
+
+  private trackApprovalRequest(requestId: RpcId, message: JsonRecord): void {
+    const method = stringFrom(message.method);
+    if (
+      method !== 'item/commandExecution/requestApproval' &&
+      method !== 'item/fileChange/requestApproval'
+    ) {
+      return;
+    }
+
+    const existing = [...this.approvals.values()].find(
+      (approval) => approval.requestId === requestId
+    );
+    const params = asRecord(message.params);
+    const command = stringArrayFrom(params.command);
+    const approval = stripUndefined({
+      approvalId: existing?.approvalId ?? `approval-${this.nextApprovalId++}`,
+      requestId,
+      kind: method.includes('commandExecution') ? 'command' : 'file',
+      method,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      threadId: stringFrom(params.threadId),
+      turnId: stringFrom(params.turnId),
+      itemId: stringFrom(params.itemId),
+      reason: stringFrom(params.reason),
+      command,
+      commandText: command?.join(' '),
+      cwd: stringFrom(params.cwd),
+      grantRoot: stringFrom(params.grantRoot),
+      availableDecisions: stringArrayFrom(params.availableDecisions),
+      raw: redactSecrets(message),
+    }) as PendingApproval;
+    this.approvals.set(approval.approvalId, approval);
+  }
+
+  private clearResolvedApproval(message: JsonRecord): void {
+    if (message.method !== 'serverRequest/resolved') return;
+    const requestId = asRecord(message.params).requestId;
+    if (!isRpcId(requestId)) return;
+    for (const approval of this.approvals.values()) {
+      if (approval.requestId === requestId) this.approvals.delete(approval.approvalId);
+    }
   }
 
   private ensureStarted(config: AgentConfig): void {
@@ -422,6 +749,9 @@ export class CodexAppServerClient {
       return;
     }
 
+    if (isRpcId(message.id)) this.trackApprovalRequest(message.id, message);
+    this.clearResolvedApproval(message);
+
     const event: AppServerEvent = { raw: redactSecrets(message) };
     if (typeof message.method === 'string') event.method = message.method;
     if ('params' in message) event.params = message.params;
@@ -452,6 +782,104 @@ export function buildSettings(
     approval_policy: task.approvalPolicy ?? config.defaultApprovalPolicy,
     sandbox_mode: mapSandboxForAppServer(sandbox),
     web_search: task.webSearch,
+  });
+}
+
+function publicApproval(approval: PendingApproval): JsonRecord {
+  return stripUndefined({
+    approvalId: approval.approvalId,
+    kind: approval.kind,
+    threadId: approval.threadId,
+    turnId: approval.turnId,
+    itemId: approval.itemId,
+    reason: approval.reason,
+    command: approval.command,
+    commandText: approval.commandText,
+    cwd: approval.cwd,
+    grantRoot: approval.grantRoot,
+    availableDecisions: approval.availableDecisions,
+    createdAt: approval.createdAt,
+  });
+}
+
+function approvalWaitMessage(approval: PendingApproval): string {
+  const target =
+    approval.kind === 'command'
+      ? approval.commandText || 'a command'
+      : approval.grantRoot || 'file changes';
+  return `codex is waiting for approval ${approval.approvalId}: ${target}. use pokedex_approve or pokedex_decline, then pokedex_read_thread.`;
+}
+
+function approvalMatchesThread(approval: PendingApproval, threadId: string | undefined): boolean {
+  return !threadId || !approval.threadId || approval.threadId === threadId;
+}
+
+function defaultSkillRoots(): string[] {
+  return [join(homedir(), '.agents', 'skills'), join(homedir(), '.codex', 'skills')];
+}
+
+function normalizeSkills(result: unknown, fallbackCwd: string): ListedSkill[] {
+  const records = asArray(asRecord(result).data);
+  return records.flatMap((record) => {
+    const cwd = stringFrom(asRecord(record).cwd) ?? fallbackCwd;
+    return asArray(asRecord(record).skills)
+      .map((skill) => listedSkillFrom(skill, cwd))
+      .filter((skill): skill is ListedSkill => Boolean(skill?.name));
+  });
+}
+
+function listedSkillFrom(value: unknown, cwd: string): ListedSkill | null {
+  const raw = asRecord(value);
+  const source = asRecord(raw.source);
+  const definition = asRecord(raw.definition);
+  const path =
+    stringFrom(raw.path) ??
+    stringFrom(raw.skillPath) ??
+    stringFrom(raw.file) ??
+    stringFrom(raw.skillFile) ??
+    stringFrom(source.path) ??
+    stringFrom(definition.path);
+  const name = stringFrom(raw.name);
+  if (!name || !path) return null;
+  return stripUndefined({
+    name,
+    path,
+    description: stringFrom(raw.description),
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : undefined,
+    source: stringFrom(source.type),
+    cwd,
+  }) as ListedSkill;
+}
+
+function resolveSkillName(name: string, skills: ListedSkill[]): SkillReference | null {
+  const exact = skills.find((skill) => skill.name === name && skill.enabled !== false);
+  const fallback = skills.find(
+    (skill) => skill.name.toLowerCase() === name.toLowerCase() && skill.enabled !== false
+  );
+  const skill = exact ?? fallback;
+  return skill ? { name: skill.name, path: skill.path } : null;
+}
+
+function linkedSkillsFromPrompt(prompt: string): SkillReference[] {
+  const links = /\[\$([a-z0-9][\w:-]*)\]\(([^)\s]+SKILL\.md)\)/gi;
+  return [...prompt.matchAll(links)].map((match) => ({ name: match[1]!, path: match[2]! }));
+}
+
+function skillMarkersFromPrompt(prompt: string): string[] {
+  const linked = new Set(linkedSkillsFromPrompt(prompt).map((skill) => skill.name));
+  const markers = /(^|[^\w])\$([a-z0-9][\w:-]*)/gi;
+  return [...prompt.matchAll(markers)]
+    .map((match) => match[2]!)
+    .filter((name) => !linked.has(name));
+}
+
+function uniqueSkills(skills: SkillReference[]): SkillReference[] {
+  const seen = new Set<string>();
+  return skills.filter((skill) => {
+    const key = `${skill.name}\n${skill.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
 }
 
@@ -500,6 +928,10 @@ function asRecord(value: unknown): JsonRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
 
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function extractThreadId(value: unknown): string | undefined {
   const raw = asRecord(value);
   const thread = asRecord(raw.thread);
@@ -533,6 +965,16 @@ function extractUsage(value: unknown): Usage | null {
 
 function stringFrom(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function stringArrayFrom(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((item): item is string => typeof item === 'string');
+  return items.length ? items : undefined;
+}
+
+function isRpcId(value: unknown): value is RpcId {
+  return typeof value === 'string' || typeof value === 'number';
 }
 
 function numberFrom(value: unknown): number {
