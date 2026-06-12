@@ -5,6 +5,7 @@ export const approvalPolicies = ['untrusted', 'on-request', 'never'] as const;
 export const reasoningEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export const verbosityLevels = ['low', 'medium', 'high'] as const;
 export const webSearchModes = ['cached', 'live', 'disabled'] as const;
+export const defaultRelayPort = 4200;
 
 export const SandboxModeSchema = z.enum(sandboxModes);
 export const ApprovalPolicySchema = z.enum(approvalPolicies);
@@ -39,7 +40,7 @@ export const WorkspaceSchema = z.object({
 
 export const AgentConfigSchema = z.object({
   userId: z.string().min(1).default('local'),
-  relayUrl: z.string().url().default('ws://127.0.0.1:3000/agent'),
+  relayUrl: z.string().url().default(`ws://127.0.0.1:${defaultRelayPort}/agent`),
   relayToken: z.string().min(16),
   appServerCommand: z.string().min(1).default('codex'),
   appServerArgs: z.array(z.string()).default(['app-server', '--listen', 'stdio://']),
@@ -118,6 +119,10 @@ export const WorkspaceRequestSchema = z.object({
   workspaceAlias: z.string().min(1),
 });
 
+export const GitCheckSchema = WorkspaceRequestSchema.extend({
+  checkRemote: z.boolean().default(false),
+});
+
 export const SkillListSchema = z.object({
   workspaceAlias: z.string().optional(),
   forceReload: z.boolean().default(false),
@@ -136,6 +141,7 @@ export type ApprovalTarget = z.infer<typeof ApprovalTargetSchema>;
 export type ApprovalApprove = z.infer<typeof ApprovalApproveSchema>;
 export type SkillList = z.infer<typeof SkillListSchema>;
 export type PluginList = z.infer<typeof PluginListSchema>;
+export type GitCheck = z.infer<typeof GitCheckSchema>;
 
 export const ToolResultSchema = z.object({
   ok: z.boolean(),
@@ -169,6 +175,8 @@ export const mcpToolNames = [
   'pokedex_list_threads',
   'pokedex_list_skills',
   'pokedex_list_plugins',
+  'pokedex_list_operations',
+  'pokedex_read_operation',
   'pokedex_start_task',
   'pokedex_start_thread',
   'pokedex_continue_task',
@@ -186,6 +194,7 @@ export const mcpToolNames = [
   'pokedex_decline',
   'pokedex_cancel_approval',
   'pokedex_get_diff',
+  'pokedex_git_check',
   'pokedex_get_usage',
 ] as const;
 
@@ -248,9 +257,21 @@ export const stableCapabilities: Capability[] = [
     source: 'app_server',
   },
   {
+    name: 'operations',
+    level: 'stable',
+    reason: 'long-running codex turns are tracked asynchronously to avoid mcp timeouts',
+    source: 'app_server',
+  },
+  {
     name: 'diff',
     level: 'adapter',
     reason: 'git diff is read locally from allowed workspaces',
+    source: 'cli',
+  },
+  {
+    name: 'git_check',
+    level: 'adapter',
+    reason: 'git and ssh/gpg environment are checked locally for headless commit and push work',
     source: 'cli',
   },
 ];

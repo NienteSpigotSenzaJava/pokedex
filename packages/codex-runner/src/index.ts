@@ -6,6 +6,7 @@ import type {
   ApprovalApprove,
   ApprovalTarget,
   AgentConfig,
+  GitCheck,
   GoalSet,
   PluginList,
   ReviewStart,
@@ -18,6 +19,7 @@ import type {
 import {
   ApprovalApproveSchema,
   ApprovalTargetSchema,
+  GitCheckSchema,
   GoalSetSchema,
   PluginListSchema,
   ReviewStartSchema,
@@ -614,17 +616,31 @@ export class CodexAppServerClient {
   }
 
   stop(): void {
+    this.stopCurrentChild();
+  }
+
+  async close(timeoutMs = 2_000): Promise<void> {
+    const child = this.stopCurrentChild();
+    if (!child) return;
+    if (await waitForChildClose(child, timeoutMs)) return;
+    signalChild(child, 'SIGKILL');
+    await waitForChildClose(child, 1_000);
+  }
+
+  private stopCurrentChild(): AppServerProcess | null {
+    const child = this.child;
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timeout);
       pending.reject(new Error('codex app-server stopped'));
       this.pending.delete(id);
     }
-    this.child?.kill();
+    if (child && !childExited(child)) signalChild(child, 'SIGTERM');
     this.approvals.clear();
     this.child = null;
     this.commandKey = '';
     this.initialized = false;
     this.initializing = null;
+    return child;
   }
 
   private collect(
@@ -825,7 +841,7 @@ export class CodexAppServerClient {
     this.stderr = '';
     const child = spawn(config.appServerCommand, config.appServerArgs, {
       cwd: process.cwd(),
-      env: process.env,
+      env: gitHeadlessEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
@@ -887,6 +903,35 @@ export class CodexAppServerClient {
       this.pending.delete(id);
     }
   }
+}
+
+function childExited(child: AppServerProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function signalChild(child: AppServerProcess, signal: NodeJS.Signals): void {
+  try {
+    child.kill(signal);
+  } catch {
+    // the app-server may have exited between the liveness check and the signal.
+  }
+}
+
+function waitForChildClose(child: AppServerProcess, timeoutMs: number): Promise<boolean> {
+  if (childExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      child.off('close', onClose);
+      resolve(false);
+    }, timeoutMs);
+    const onClose = () => done(true);
+    const done = (closed: boolean) => {
+      clearTimeout(timeout);
+      child.off('close', onClose);
+      resolve(closed);
+    };
+    child.once('close', onClose);
+  });
 }
 
 export function buildSettings(
@@ -1096,15 +1141,196 @@ export async function diffResult(config: AgentConfig, input: unknown): Promise<T
   const args = WorkspaceRequestSchema.parse(input);
   const workspace = findWorkspace(config, args.workspaceAlias);
   const root = resolveWorkspaceRoot(workspace);
-  const [stat, names] = await Promise.all([
+  const [status, unstagedStat, stagedStat, unstagedNames, stagedNames] = await Promise.all([
+    runPlainCommand({
+      command: 'git',
+      args: ['status', '--short'],
+      cwd: root,
+      env: gitHeadlessEnv(),
+    }),
     runPlainCommand({ command: 'git', args: ['diff', '--stat'], cwd: root, env: process.env }),
-    runPlainCommand({ command: 'git', args: ['diff', '--name-only'], cwd: root, env: process.env }),
+    runPlainCommand({
+      command: 'git',
+      args: ['diff', '--cached', '--stat'],
+      cwd: root,
+      env: gitHeadlessEnv(),
+    }),
+    runPlainCommand({
+      command: 'git',
+      args: ['diff', '--name-only'],
+      cwd: root,
+      env: gitHeadlessEnv(),
+    }),
+    runPlainCommand({
+      command: 'git',
+      args: ['diff', '--cached', '--name-only'],
+      cwd: root,
+      env: gitHeadlessEnv(),
+    }),
   ]);
+  const statusFiles = parseStatusFiles(status.stdout);
+  const files = uniqueStrings([
+    ...unstagedNames.stdout.split(/\r?\n/).filter(Boolean),
+    ...stagedNames.stdout.split(/\r?\n/).filter(Boolean),
+    ...statusFiles,
+  ]);
+  const stat = [unstagedStat.stdout.trim(), stagedStat.stdout.trim()].filter(Boolean).join('\n');
+  const ok = [status, unstagedStat, stagedStat, unstagedNames, stagedNames].every(
+    (check) => check.exitCode === 0
+  );
+
   return {
-    ok: stat.exitCode === 0 && names.exitCode === 0,
-    summary: stat.stdout.trim() || 'no diff.',
-    data: { stat: stat.stdout, files: names.stdout.split(/\r?\n/).filter(Boolean) },
+    ok,
+    summary: stat || (files.length ? `${files.length} changed file(s).` : 'no diff.'),
+    data: {
+      stat,
+      status: status.stdout,
+      files,
+      unstagedFiles: unstagedNames.stdout.split(/\r?\n/).filter(Boolean),
+      stagedFiles: stagedNames.stdout.split(/\r?\n/).filter(Boolean),
+      statusFiles,
+    },
   };
+}
+
+export async function gitCheckResult(config: AgentConfig, input: unknown): Promise<ToolResult> {
+  const args = GitCheckSchema.parse(input) satisfies GitCheck;
+  const workspace = findWorkspace(config, args.workspaceAlias);
+  const root = resolveWorkspaceRoot(workspace);
+  const gitEnv = gitHeadlessEnv();
+  const checks = Object.fromEntries(
+    await Promise.all(
+      [
+        ['insideWorkTree', ['rev-parse', '--is-inside-work-tree']],
+        ['topLevel', ['rev-parse', '--show-toplevel']],
+        ['branch', ['branch', '--show-current']],
+        ['statusShort', ['status', '--short']],
+        ['remoteVerbose', ['remote', '-v']],
+        ['pushRemote', ['remote', 'get-url', '--push', 'origin']],
+        ['userName', ['config', '--get', 'user.name']],
+        ['userEmail', ['config', '--get', 'user.email']],
+        ['commitGpgSign', ['config', '--get', 'commit.gpgsign']],
+        ['gpgFormat', ['config', '--get', 'gpg.format']],
+        ['userSigningKey', ['config', '--get', 'user.signingkey']],
+        ['credentialHelper', ['config', '--get', 'credential.helper']],
+        ['coreSshCommand', ['config', '--get', 'core.sshCommand']],
+      ].map(async ([name, gitArgs]) => [
+        name,
+        await runPlainCommand({
+          command: 'git',
+          args: gitArgs as string[],
+          cwd: root,
+          env: gitEnv,
+          timeoutMs: 10_000,
+        }),
+      ])
+    )
+  );
+  const sshAgent = await runPlainCommand({
+    command: 'ssh-add',
+    args: ['-l'],
+    cwd: root,
+    env: gitEnv,
+    timeoutMs: 5_000,
+  }).catch((error: unknown) => ({
+    exitCode: 1,
+    stdout: '',
+    stderr: error instanceof Error ? error.message : 'ssh-add failed',
+  }));
+  const remoteAuth = args.checkRemote
+    ? await runPlainCommand({
+        command: 'git',
+        args: ['ls-remote', '--heads', 'origin'],
+        cwd: root,
+        env: gitEnv,
+        timeoutMs: 15_000,
+      })
+    : undefined;
+  const issues = gitCheckIssues(checks, sshAgent, remoteAuth);
+
+  return {
+    ok: checkSucceeded(checks.insideWorkTree) && issues.length === 0,
+    summary: issues.length
+      ? `git check found ${issues.length} issue${issues.length === 1 ? '' : 's'} for commit/push.`
+      : 'git check passed for local commit/push prerequisites.',
+    data: stripUndefined({
+      workspaceAlias: workspace.alias,
+      root,
+      checks: redactSecrets(checks),
+      env: gitEnvSummary(gitEnv),
+      sshAgent: redactSecrets(sshAgent),
+      remoteAuth: remoteAuth ? redactSecrets(remoteAuth) : undefined,
+      issues,
+    }),
+  };
+}
+
+function gitHeadlessEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+}
+
+function gitEnvSummary(env: NodeJS.ProcessEnv): JsonRecord {
+  return {
+    hasSshAuthSock: Boolean(env.SSH_AUTH_SOCK),
+    hasGitAskpass: Boolean(env.GIT_ASKPASS),
+    hasSshAskpass: Boolean(env.SSH_ASKPASS),
+    hasGpgTty: Boolean(env.GPG_TTY),
+    hasGhToken: Boolean(env.GH_TOKEN || env.GITHUB_TOKEN),
+    gitTerminalPrompt: env.GIT_TERMINAL_PROMPT,
+  };
+}
+
+function gitCheckIssues(
+  checks: Record<string, { exitCode: number; stdout: string; stderr: string }>,
+  sshAgent: { exitCode: number; stdout: string; stderr: string },
+  remoteAuth: { exitCode: number; stdout: string; stderr: string } | undefined
+): string[] {
+  const issues: string[] = [];
+  if (!checkSucceeded(checks.insideWorkTree)) issues.push('workspace is not a git repository');
+  if (!checkHasOutput(checks.userName)) issues.push('git user.name is not configured');
+  if (!checkHasOutput(checks.userEmail)) issues.push('git user.email is not configured');
+  if (!checkHasOutput(checks.pushRemote))
+    issues.push('git remote origin push URL is not configured');
+  if (
+    remoteNeedsSshAuth(checks.pushRemote?.stdout) &&
+    sshAgent.exitCode !== 0 &&
+    !process.env.GH_TOKEN &&
+    !process.env.GITHUB_TOKEN
+  )
+    issues.push('no usable ssh-agent was visible to the Pokedex process');
+  if (remoteAuth && remoteAuth.exitCode !== 0)
+    issues.push('remote auth check failed in non-interactive mode');
+  return issues;
+}
+
+function parseStatusFiles(status: string): string[] {
+  return status
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim())
+    .map((line) => line.split(' -> ').pop() ?? line)
+    .filter(Boolean);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function remoteNeedsSshAuth(remote: string | undefined): boolean {
+  const value = remote?.trim() ?? '';
+  return Boolean(value && (value.startsWith('git@') || value.startsWith('ssh://')));
+}
+
+function checkSucceeded(
+  check: { exitCode: number; stdout: string; stderr: string } | undefined
+): boolean {
+  return Boolean(check && check.exitCode === 0);
+}
+
+function checkHasOutput(
+  check: { exitCode: number; stdout: string; stderr: string } | undefined
+): boolean {
+  return Boolean(check && check.exitCode === 0 && check.stdout.trim());
 }
 
 export async function runPlainCommand(command: {
@@ -1112,6 +1338,7 @@ export async function runPlainCommand(command: {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  timeoutMs?: number;
 }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   let stdout = '';
   let stderr = '';
@@ -1122,12 +1349,25 @@ export async function runPlainCommand(command: {
       env: command.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    let timer: NodeJS.Timeout | undefined;
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => (stdout += chunk));
     child.stderr?.on('data', (chunk: string) => (stderr += chunk));
-    child.on('error', reject);
-    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', (error) => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer);
+      resolve(code ?? 1);
+    });
+    if (command.timeoutMs) {
+      timer = setTimeout(() => {
+        stderr += `\ncommand timed out after ${command.timeoutMs}ms`;
+        child.kill('SIGTERM');
+      }, command.timeoutMs);
+    }
   });
 
   return { exitCode, stdout, stderr };

@@ -31,7 +31,7 @@ describe('protocol schemas', () => {
     });
 
     expect(parsed.userId).toBe('local');
-    expect(parsed.relayUrl).toBe('ws://127.0.0.1:3000/agent');
+    expect(parsed.relayUrl).toBe('ws://127.0.0.1:4200/agent');
     expect(parsed.appServerCommand).toBe('codex');
     expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
   });
@@ -79,6 +79,8 @@ describe('protocol schemas', () => {
     expect(tools.some((tool) => tool.name === 'pokedex_start_task')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_list_skills')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_list_plugins')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_read_operation')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_git_check')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_approve')).toBe(true);
     expect(tools.every((tool) => tool.inputSchema && typeof tool.inputSchema === 'object')).toBe(
       true
@@ -100,5 +102,21 @@ describe('protocol schemas', () => {
     expect(text).toContain('internal tool state for follow-up only');
     expect(text).toContain('"threadId": "thread-1"');
     expect(text).not.toContain('debug/event');
+  });
+
+  it('declares async operation tracking capability', () => {
+    expect(
+      stableCapabilities.some(
+        (capability) => capability.name === 'operations' && capability.source === 'app_server'
+      )
+    ).toBe(true);
+  });
+
+  it('declares git check capability', () => {
+    expect(
+      stableCapabilities.some(
+        (capability) => capability.name === 'git_check' && capability.source === 'cli'
+      )
+    ).toBe(true);
   });
 });

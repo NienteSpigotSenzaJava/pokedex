@@ -92,7 +92,7 @@ Pokedex stores config in:
 ~/.pokedex/config.jsonc
 ```
 
-The JSONC config contains the random relay token, default model settings, permissions, and workspace list. Default local wiring such as port `3000`, user `local`, and `codex app-server --listen stdio://` is kept internal unless you override it.
+The JSONC config contains the random relay token, default model settings, permissions, and workspace list. Default local wiring such as port `4200`, user `local`, and `codex app-server --listen stdio://` is kept internal unless you override it. If the configured relay port is busy or unavailable, Pokedex automatically tries the next usable local port for that run.
 
 ## 🎛️ Runtime Settings
 
@@ -125,6 +125,8 @@ pokedex_list_sessions
 pokedex_list_threads
 pokedex_list_skills
 pokedex_list_plugins
+pokedex_list_operations
+pokedex_read_operation
 pokedex_start_task
 pokedex_start_thread
 pokedex_continue_task
@@ -142,6 +144,7 @@ pokedex_approve
 pokedex_decline
 pokedex_cancel_approval
 pokedex_get_diff
+pokedex_git_check
 pokedex_get_usage
 ```
 
@@ -153,7 +156,11 @@ Use `pokedex_list_skills` to fetch local skills from Codex, including `~/.agents
 
 Use `pokedex_list_plugins` to fetch installed Codex plugins and marketplace plugin data when the local Codex app-server exposes it.
 
+Long-running Codex work is tracked as a local operation. If a start, send, resume, or review call returns an `operationId` with `operationStatus: "running"`, the work is not complete yet. Do not report success and do not retry the same request. Use `pokedex_read_operation` with that `operationId`, or `pokedex_list_operations` after reconnects, failed responses, or when checking what Codex is doing.
+
 Use `pokedex_get_usage` to inspect observed token usage and account rate-limit data when Codex exposes it through app-server.
+
+Use `pokedex_git_check` before commit or push work to verify git identity, remotes, and the headless SSH/GPG/credential environment visible to Pokedex.
 
 If Codex pauses for approval, ask Poke to list approvals, then approve or decline the pending request. When only one approval is pending, `pokedex_approve` and `pokedex_decline` do not need an `approvalId`.
 
@@ -171,10 +178,10 @@ If Codex cannot be found:
 npm install -g @openai/codex@latest
 ```
 
-If port `3000` is busy:
+To pin a different relay port:
 
 ```bash
-npx codex-to-poke --port 3010
+npx codex-to-poke --port 4201
 ```
 
 Inside Pokedex, use `help` for a list of available commands.

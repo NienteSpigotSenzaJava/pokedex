@@ -14,9 +14,23 @@ describe('pokedex agent config loading', () => {
     expect(source).toContain("if (toolName === 'pokedex_list_skills')");
     expect(source).toContain("if (toolName === 'pokedex_list_plugins')");
     expect(source).toContain(
+      "if (toolName === 'pokedex_list_operations') return listOperations();"
+    );
+    expect(source).toContain(
+      "if (toolName === 'pokedex_read_operation') return readOperation(args);"
+    );
+    expect(source).toContain(
       "if (toolName === 'pokedex_get_usage') return await usageResult(config);"
     );
+    expect(source).toContain("if (toolName === 'pokedex_git_check')");
     expect(source).toContain('trackRunnerProgress');
+    expect(source).toContain('async function trackOperation');
+    expect(source).toContain('use pokedex_read_operation with operationId');
+    expect(source).toContain('is not complete yet');
+    expect(source).toContain('incomplete: true');
+    expect(source).toContain('let activeSocket: WebSocket | null = null;');
+    expect(source).toContain('if (reconnectTimer) clearTimeout(reconnectTimer);');
+    expect(source).toContain('await codex.close();');
     expect(source).toContain(
       'async function dispatch(toolName: string, args: Record<string, unknown>)'
     );

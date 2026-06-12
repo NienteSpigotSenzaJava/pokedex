@@ -14,6 +14,7 @@ describe('pokedex cli', () => {
     expect(output).not.toContain('Poke login opens automatically if needed');
     expect(output).not.toContain('codex login');
     expect(output).toContain('pokedex help');
+    expect(output).toContain('[--port 4200]');
     expect(output).toContain('~/.pokedex/config.jsonc');
     expect(output).toContain('output [relay|agent|poke]');
     expect(output).toContain('show recent logs for one service or all services');
@@ -85,6 +86,10 @@ describe('pokedex cli', () => {
   it('writes commented jsonc with inline app-server args', () => {
     const source = readFileSync(cliPath, 'utf8');
 
+    expect(source).toContain("const defaultPort = '4200';");
+    expect(source).toContain("const defaultPortLabel = '4200';");
+    expect(source).toContain('const portScanLimit = 100;');
+    expect(source).toContain('const unprivilegedPortStart = 1024;');
     expect(source).toContain('function stringifyConfigJsonc');
     expect(source).toContain('function advancedConfigLines');
     expect(source).toContain('optional relay port override');
@@ -102,6 +107,26 @@ describe('pokedex cli', () => {
     );
     expect(source).not.toContain('console.log(`spaces ${config.workspaces.length}');
     expect(source).not.toContain('console.log(`space  ${activeWorkspace().alias}');
+  });
+
+  it('does not report downstream services as ok when relay stops', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain("if (name === 'relay') markRelayDependentsBlocked();");
+    expect(source).toContain("statuses[name] = 'blocked';");
+    expect(source).toContain("status === 'blocked'");
+  });
+
+  it('falls forward from busy relay ports before starting services', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain("import { createServer as createNetServer } from 'node:net';");
+    expect(source).toContain('await useAvailableRelayPort();');
+    expect(source).toContain('async function findAvailablePort(start)');
+    expect(source).toContain('function portSearchRanges(start)');
+    expect(source).toContain("server.listen(port, '127.0.0.1');");
+    expect(source).toContain('port ${displayPort(requested)} is unavailable; using ${port}');
+    expect(source).toContain('configuredRelayPort || config.port');
   });
 
   it('does not rewrite an existing config just by starting pokedex', () => {
@@ -129,7 +154,7 @@ describe('pokedex cli', () => {
   it('lets the poke tunnel remove its temporary mcp integration before shutdown', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain("await stopManagedChild('poke', 'SIGINT', 20_000);");
+    expect(source).toContain("await stopManagedChild('poke', 'SIGINT', 20_000)");
     expect(source).toContain(
       '// poke removes the temporary mcp connection from its own signal handler.'
     );
@@ -139,6 +164,17 @@ describe('pokedex cli', () => {
       "process.once('uncaughtException', (error) => void stopAfterFatal(error));"
     );
     expect(source).toContain('return child.exitCode !== null || child.signalCode !== null;');
+  });
+
+  it('waits for detached process groups to stop before restarting', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('const managedShutdownPollMs = 50;');
+    expect(source).toContain('await waitForManagedChildExit(entry, timeoutMs)');
+    expect(source).toContain('await waitForManagedChildExit(entry, 2_000)');
+    expect(source).toContain('process.kill(-pid, 0)');
+    expect(source).toContain('process.kill(-entry.child.pid, signal)');
+    expect(source).toContain('Start was cancelled so no duplicate stack is left running.');
   });
 
   it('makes workspace write on effective immediately and after restart', () => {

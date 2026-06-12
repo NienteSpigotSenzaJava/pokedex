@@ -20,6 +20,7 @@ import {
 import { SecurityError, redactSecrets, verifyBearerToken } from '@pokedex/security';
 import { mcpToolDefinitions, toolSpecs } from './tools.js';
 
+const defaultPort = 4200;
 const options = relayOptions();
 
 const logger = pino({
@@ -35,16 +36,27 @@ const expectedUserId = options.userId;
 const agents = new Map<string, WebSocket>();
 const pending = new Map<
   string,
-  { resolve: (value: ToolResult) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout }
+  {
+    userId: string;
+    resolve: (value: ToolResult) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }
 >();
 const mcpToolNameSet = new Set<string>(mcpToolNames);
 const protocolVersion = '2025-11-25';
 const agentResponseTimeoutMs = 600_000;
+const shutdownGraceMs = 3_000;
+const shutdownSignals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+let shuttingDown = false;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(pinoHttp({ logger }));
 server.on('error', exitOnListenError);
 wss.on('error', exitOnListenError);
+for (const signal of shutdownSignals) {
+  process.once(signal, () => void shutdown(signal));
+}
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, name: 'pokedex', agents: agents.size, tools: toolSpecs.length });
@@ -90,22 +102,32 @@ function serverInfo() {
 }
 
 async function handleMcpRequest(req: Request, res: express.Response): Promise<void> {
+  const startedAt = Date.now();
+  let completed = false;
+  res.on('close', () => {
+    if (completed) return;
+    req.log.warn({ elapsedMs: Date.now() - startedAt }, 'mcp client disconnected before response');
+  });
   try {
     const userId = authenticateMcpRequest(req);
     const response = await handleJsonRpc(userId, req.body);
     if (!response) {
+      completed = true;
       res.status(202).send('');
       return;
     }
     res.setHeader('mcp-session-id', req.header('mcp-session-id') ?? randomUUID());
+    completed = true;
     res.json(response);
   } catch (error) {
     const status = error instanceof SecurityError ? 401 : 500;
     req.log.warn({ err: redactSecrets(error) }, 'mcp request failed');
-    if (!res.headersSent)
+    if (!res.headersSent) {
+      completed = true;
       res
         .status(status)
         .json({ error: error instanceof Error ? error.message : 'mcp request failed' });
+    }
   }
 }
 
@@ -191,20 +213,25 @@ wss.on('connection', (socket, request) => {
     logger.info({ userId }, 'agent connected');
 
     socket.on('message', (raw) => {
-      const response = AgentResponseSchema.parse(JSON.parse(raw.toString()));
-      const waiting = pending.get(response.id);
-      if (!waiting) return;
-      clearTimeout(waiting.timeout);
-      pending.delete(response.id);
-      if (response.error) waiting.reject(new Error(response.error));
-      else
-        waiting.resolve(
-          response.result ?? { ok: false, summary: 'agent returned no result', data: {} }
-        );
+      try {
+        const response = AgentResponseSchema.parse(JSON.parse(raw.toString()));
+        const waiting = pending.get(response.id);
+        if (!waiting) return;
+        clearTimeout(waiting.timeout);
+        pending.delete(response.id);
+        if (response.error) waiting.reject(new Error(response.error));
+        else
+          waiting.resolve(
+            response.result ?? { ok: false, summary: 'agent returned no result', data: {} }
+          );
+      } catch (error) {
+        logger.warn({ err: redactSecrets(error) }, 'agent response could not be parsed');
+      }
     });
 
     socket.on('close', () => {
       if (agents.get(userId) === socket) agents.delete(userId);
+      rejectPendingForUser(userId, new Error('local codex agent disconnected before answering'));
       logger.warn({ userId }, 'agent disconnected');
     });
   } catch (error) {
@@ -241,6 +268,13 @@ function authenticateMcpRequest(req: Request): string {
 }
 
 async function callAgent(request: AgentRequest): Promise<ToolResult> {
+  if (shuttingDown)
+    return {
+      ok: false,
+      summary: 'relay is shutting down.',
+      data: { connected: false },
+    };
+
   const socket =
     agents.get(request.userId) ?? (agents.size === 1 ? [...agents.values()][0] : undefined);
   if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -257,8 +291,72 @@ async function callAgent(request: AgentRequest): Promise<ToolResult> {
       reject(new Error('agent response timeout'));
     }, agentResponseTimeoutMs);
 
-    pending.set(request.id, { resolve, reject, timeout });
-    socket.send(JSON.stringify(request));
+    pending.set(request.id, { userId: request.userId, resolve, reject, timeout });
+    try {
+      socket.send(JSON.stringify(request));
+    } catch (error) {
+      clearTimeout(timeout);
+      pending.delete(request.id);
+      reject(error instanceof Error ? error : new Error('agent websocket send failed'));
+    }
+  });
+}
+
+function rejectPendingForUser(userId: string, error: Error): void {
+  for (const [id, waiting] of pending) {
+    if (waiting.userId !== userId) continue;
+    clearTimeout(waiting.timeout);
+    pending.delete(id);
+    waiting.reject(error);
+  }
+}
+
+function rejectAllPending(error: Error): void {
+  for (const [id, waiting] of pending) {
+    clearTimeout(waiting.timeout);
+    pending.delete(id);
+    waiting.reject(error);
+  }
+}
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'relay shutting down');
+  rejectAllPending(new Error('relay stopped before the local codex agent answered'));
+  closeAgentSockets();
+  const forceExit = setTimeout(() => {
+    terminateAgentSockets();
+    server.closeAllConnections();
+    logger.warn({ signal }, 'relay shutdown forced after grace period');
+    process.exit(1);
+  }, shutdownGraceMs);
+  forceExit.unref();
+  await Promise.allSettled([closeWebSocketServer(), closeHttpServer()]);
+  clearTimeout(forceExit);
+  process.exit(0);
+}
+
+function closeAgentSockets(): void {
+  for (const socket of new Set(wss.clients)) {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
+      socket.close(1001, 'relay shutting down');
+  }
+  agents.clear();
+}
+
+function terminateAgentSockets(): void {
+  for (const socket of wss.clients) socket.terminate();
+}
+
+function closeWebSocketServer(): Promise<void> {
+  return new Promise((resolve) => wss.close(() => resolve()));
+}
+
+function closeHttpServer(): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeIdleConnections();
   });
 }
 
@@ -273,14 +371,14 @@ function relayOptions(): { port: number; token: string; userId: string } {
       userId?: string;
     };
     return {
-      port: Number(value('--port') ?? config.port ?? 3000),
+      port: Number(value('--port') ?? config.port ?? defaultPort),
       token: value('--token') ?? config.relayToken ?? randomBytes(32).toString('hex'),
       userId: value('--user-id') ?? config.userId ?? 'local',
     };
   }
 
   return {
-    port: Number(value('--port') ?? 3000),
+    port: Number(value('--port') ?? defaultPort),
     token: value('--token') ?? randomBytes(32).toString('hex'),
     userId: value('--user-id') ?? '',
   };

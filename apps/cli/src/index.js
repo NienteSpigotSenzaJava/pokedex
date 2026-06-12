@@ -2,6 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
@@ -19,6 +20,11 @@ const invocationCwd = process.env.INIT_CWD ?? process.cwd();
 const managedChildren = new Map();
 const serviceLogs = new Map();
 const statuses = { relay: 'idle', agent: 'idle', poke: 'idle' };
+const defaultPort = '4200';
+const defaultPortLabel = '4200';
+const portScanLimit = 100;
+const unprivilegedPortStart = 1024;
+const managedShutdownPollMs = 50;
 const bannerText = [
   '▄▄▄▄   ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄ ▄▄▄▄  ▄▄▄▄▄ ▄▄ ▄▄ ',
   '██▄█▀ ██▀██ ██▄█▀ ██▄▄  ██▀██ ██▄▄  ▀█▄█▀ ',
@@ -49,6 +55,7 @@ const interactiveCommands = [
 ];
 let configPath = '';
 let config = {};
+let configuredRelayPort = '';
 let readline = null;
 let stopping = false;
 let restarting = false;
@@ -61,6 +68,7 @@ async function local() {
   configPath = existingConfigPath();
   const configFileExists = existsSync(configPath);
   config = createConfig(loadSavedConfig());
+  configuredRelayPort = config.port;
   if (!configFileExists || startupConfigOverrides()) saveConfig();
 
   printBanner();
@@ -70,7 +78,11 @@ async function local() {
     await startStack();
   } catch (error) {
     console.error(formatError(error));
-    await stopStack(false);
+    try {
+      await stopStack(false);
+    } catch (stopError) {
+      console.error(formatError(stopError));
+    }
     process.exit(1);
   }
   startConsole();
@@ -119,10 +131,12 @@ function createConfig(saved) {
     defaultSandbox: sandboxFor(workspaceWrite, workspaceFullAccess),
   });
 
+  const port = normalizePort(value('--port') ?? saved.port ?? defaultPort, '--port <number>');
+
   return {
-    port: String(value('--port') ?? saved.port ?? '3000'),
+    port: String(port),
     userId: value('--user-id') ?? saved.userId ?? 'local',
-    relayUrl: `ws://127.0.0.1:${value('--port') ?? saved.port ?? '3000'}/agent`,
+    relayUrl: relayUrlForPort(port),
     relayToken: value('--token') ?? saved.relayToken ?? randomHex(),
     appServerCommand: value('--codex') ?? saved.appServerCommand ?? 'codex',
     appServerArgs: Array.isArray(saved.appServerArgs)
@@ -172,6 +186,7 @@ function normalizeWorkspaces(workspaces, defaults) {
 async function startStack({ announceReady = true } = {}) {
   await stopStack(false);
   await ensureCodexReady();
+  await useAvailableRelayPort();
 
   statuses.relay = 'starting';
   spawnManaged('relay', 'pokedex-relay', [
@@ -475,9 +490,10 @@ async function setWorkspaceAccess(alias, key, raw) {
 }
 
 async function setPort(raw) {
-  if (!/^\d+$/.test(raw ?? '')) throw new Error('usage: port <number>');
-  config.port = String(Number(raw));
-  config.relayUrl = `ws://127.0.0.1:${config.port}/agent`;
+  const port = normalizePort(raw, 'port <number>');
+  configuredRelayPort = String(port);
+  config.port = String(port);
+  config.relayUrl = relayUrlForPort(port);
   await saveSetting('port', config.port, true);
 }
 
@@ -501,6 +517,68 @@ async function setEnum(key, raw, allowed) {
 async function restartStack() {
   console.log('✅ restarting stack');
   await startStack();
+}
+
+async function useAvailableRelayPort() {
+  const requested = normalizePort(configuredRelayPort || config.port, 'port <number>');
+  const port = await findAvailablePort(requested);
+  config.port = String(port);
+  config.relayUrl = relayUrlForPort(port);
+  if (port !== requested)
+    console.log(`⚠️ port ${displayPort(requested)} is unavailable; using ${port} for this run.`);
+}
+
+async function findAvailablePort(start) {
+  const ranges = portSearchRanges(start);
+  for (const [first, last] of ranges) {
+    for (let port = first; port <= last; port += 1) {
+      if (await isPortAvailable(port)) return port;
+    }
+  }
+  throw new Error(
+    `no available localhost port found from ${displayPort(start)} through ${ranges.at(-1)?.[1] ?? start}.`
+  );
+}
+
+function portSearchRanges(start) {
+  const ranges = [[start, Math.min(65535, start + portScanLimit - 1)]];
+  if (start < unprivilegedPortStart && ranges[0][1] < unprivilegedPortStart)
+    ranges.push([
+      unprivilegedPortStart,
+      Math.min(65535, unprivilegedPortStart + portScanLimit - 1),
+    ]);
+  return ranges;
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolvePort) => {
+    const server = createNetServer();
+    let settled = false;
+    const settle = (available) => {
+      if (settled) return;
+      settled = true;
+      resolvePort(available);
+    };
+    server.unref();
+    server.once('error', () => settle(false));
+    server.once('listening', () => server.close(() => settle(true)));
+    server.listen(port, '127.0.0.1');
+  });
+}
+
+function normalizePort(raw, usage) {
+  const port = Number(raw);
+  if (!/^\d+$/.test(String(raw ?? '')) || !Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`usage: ${usage}`);
+  return port;
+}
+
+function relayUrlForPort(port) {
+  return `ws://127.0.0.1:${port}/agent`;
+}
+
+function displayPort(port) {
+  return port === Number(defaultPort) ? defaultPortLabel : String(port);
 }
 
 async function saveSetting(setting, value, restart = false) {
@@ -583,12 +661,21 @@ function spawnManaged(name, bin, binArgs) {
     entry.signal = signal;
     if (stopping || restarting) return;
     statuses[name] = 'down';
+    if (name === 'relay') markRelayDependentsBlocked();
     if (!readline) return;
-    console.error(
-      `\n⚠️ ${serviceTitle(name)} stopped. Type "status" or "restart"; type "help" for commands, or just ask your Poke.`
-    );
+    const nextStep =
+      name === 'relay'
+        ? 'Type "status" or "restart"; type "help" for commands.'
+        : 'Type "status" or "restart"; type "help" for commands, or just ask your Poke.';
+    console.error(`\n⚠️ ${serviceTitle(name)} stopped. ${nextStep}`);
     readline?.prompt();
   });
+}
+
+function markRelayDependentsBlocked() {
+  for (const name of ['agent', 'poke']) {
+    if (statuses[name] === 'ok' || statuses[name] === 'starting') statuses[name] = 'blocked';
+  }
 }
 
 function failIfServiceExited(name, detail) {
@@ -640,18 +727,28 @@ function appendLog(name, chunk) {
 
 async function stopStack(final) {
   restarting = !final;
+  const failures = new Set();
   // poke removes the temporary mcp connection from its own signal handler.
-  await stopManagedChild('poke', 'SIGINT', 20_000);
-  await Promise.all(
-    [...managedChildren.keys()].map((name) => stopManagedChild(name, 'SIGTERM', 8_000))
+  if (!(await stopManagedChild('poke', 'SIGINT', 20_000))) failures.add('poke');
+  const stopResults = await Promise.all(
+    [...managedChildren.keys()].map(async (name) => ({
+      name,
+      stopped: await stopManagedChild(name, 'SIGTERM', 8_000),
+    }))
   );
-  managedChildren.clear();
+  for (const { name, stopped: isStopped } of stopResults) {
+    if (!isStopped) failures.add(name);
+  }
   if (!final) {
     restarting = false;
     statuses.relay = 'idle';
     statuses.agent = 'idle';
     statuses.poke = 'idle';
   }
+  if (failures.size && !final)
+    throw new Error(
+      `${[...failures].map(serviceTitle).join(', ')} did not stop cleanly. Start was cancelled so no duplicate stack is left running.`
+    );
 }
 
 async function stopManaged(code) {
@@ -664,54 +761,83 @@ async function stopManaged(code) {
 
 async function stopManagedChild(name, signal, timeoutMs) {
   const entry = managedChildren.get(name);
-  if (!entry) return;
+  if (!entry) return true;
   signalManagedChild(name, entry, signal);
-  if (!(await waitForExit(entry.child, timeoutMs))) {
+  if (!(await waitForManagedChildExit(entry, timeoutMs))) {
     appendLog(name, `${serviceTitle(name)} did not stop in time; forcing shutdown.`);
     signalManagedChild(name, entry, 'SIGKILL');
-    await waitForExit(entry.child, 2_000);
+    if (!(await waitForManagedChildExit(entry, 2_000))) {
+      appendLog(name, `${serviceTitle(name)} still appears to be running after SIGKILL.`);
+      return false;
+    }
   }
   managedChildren.delete(name);
+  return true;
 }
 
 function signalManagedChild(name, entry, signal) {
+  const canSignalGroup = entry.detached && entry.child.pid && process.platform !== 'win32';
+  if (canSignalGroup && processGroupAlive(entry.child.pid)) {
+    try {
+      process.kill(-entry.child.pid, signal);
+      return;
+    } catch (error) {
+      if (error?.code === 'ESRCH') return;
+      appendLog(name, `${serviceTitle(name)} process-group ${signal} failed: ${error.message}`);
+    }
+  }
   if (childExited(entry.child)) return;
   try {
-    if (entry.detached && entry.child.pid) process.kill(-entry.child.pid, signal);
-    else entry.child.kill(signal);
+    entry.child.kill(signal);
   } catch (error) {
     if (error?.code === 'ESRCH') return;
-    if (entry.detached) {
-      try {
-        entry.child.kill(signal);
-        return;
-      } catch (fallbackError) {
-        appendLog(
-          name,
-          `${serviceTitle(name)} ${signal} fallback failed: ${fallbackError.message}`
-        );
-      }
-    }
     appendLog(name, `${serviceTitle(name)} ${signal} failed: ${error.message}`);
   }
 }
 
-function waitForExit(child, timeoutMs = 0) {
-  if (childExited(child)) return Promise.resolve(true);
+function waitForManagedChildExit(entry, timeoutMs) {
+  if (managedChildStopped(entry)) return Promise.resolve(true);
   return new Promise((resolveExit) => {
-    let timer;
-    const done = () => {
-      if (timer) clearTimeout(timer);
-      resolveExit(true);
+    let pollTimer;
+    let timeoutTimer;
+    const done = (stopped) => {
+      if (pollTimer) clearTimeout(pollTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      entry.child.off('exit', check);
+      resolveExit(stopped);
     };
-    child.once('exit', done);
-    if (timeoutMs) {
-      timer = setTimeout(() => {
-        child.off('exit', done);
-        resolveExit(false);
-      }, timeoutMs);
-    }
+    const check = () => {
+      if (managedChildStopped(entry)) {
+        done(true);
+        return;
+      }
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(check, managedShutdownPollMs);
+    };
+    entry.child.once('exit', check);
+    timeoutTimer = setTimeout(() => {
+      if (pollTimer) clearTimeout(pollTimer);
+      entry.child.off('exit', check);
+      resolveExit(false);
+    }, timeoutMs);
+    check();
   });
+}
+
+function managedChildStopped(entry) {
+  if (!childExited(entry.child)) return false;
+  return !entry.detached || !processGroupAlive(entry.child.pid);
+}
+
+function processGroupAlive(pid) {
+  if (!pid || process.platform === 'win32') return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    return true;
+  }
 }
 
 function childExited(child) {
@@ -729,7 +855,14 @@ async function fetchJson(url) {
 
 function saveConfig() {
   mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, stringifyConfigJsonc(config));
+  writeFileSync(
+    configPath,
+    stringifyConfigJsonc({
+      ...config,
+      port: configuredRelayPort || config.port,
+      relayUrl: relayUrlForPort(configuredRelayPort || config.port),
+    })
+  );
 }
 
 function loadSavedConfig() {
@@ -784,9 +917,9 @@ function stringifyConfigJsonc(raw) {
 
 function advancedConfigLines(raw) {
   const lines = [];
-  const defaultRelayUrl = `ws://127.0.0.1:${raw.port ?? '3000'}/agent`;
-  addAdvancedConfigLine(lines, raw.port !== '3000', [
-    '  // optional relay port override. omit this for the default 3000.',
+  const defaultRelayUrl = `ws://127.0.0.1:${raw.port ?? defaultPort}/agent`;
+  addAdvancedConfigLine(lines, raw.port !== defaultPort, [
+    `  // optional relay port override. omit this for the default ${defaultPortLabel}.`,
     `  "port": ${quote(raw.port)},`,
   ]);
   addAdvancedConfigLine(lines, raw.userId !== 'local', [
@@ -1007,7 +1140,7 @@ function modeLabel(workspace) {
 function statusIcon(status) {
   if (status === 'ok') return '✅';
   if (status === 'starting') return '⏳';
-  if (status === 'error' || status === 'down') return '⚠️';
+  if (status === 'error' || status === 'down' || status === 'blocked') return '⚠️';
   return '•';
 }
 
@@ -1022,7 +1155,7 @@ function serviceHint(name, detail) {
   if (name === 'poke') return 'Run `npx poke@latest login`, then start Pokedex again.';
   if (name === 'agent') return 'Type `output agent` to inspect Codex app-server output.';
   if (name === 'relay')
-    return 'Check the port with `pokedex --port <number>`, then start Pokedex again.';
+    return `Pokedex tries the next local port automatically. Type \`output relay\`, or run \`pokedex --port <number>\` to pin a port.`;
   return detail;
 }
 
@@ -1231,7 +1364,7 @@ function help() {
 Local Poke to Codex bridge.
 
 usage
-  pokedex [--workspace .] [--port 3000] [--write] [--read-only]
+  pokedex [--workspace .] [--port ${defaultPortLabel}] [--write] [--read-only]
   pokedex help
 
 config

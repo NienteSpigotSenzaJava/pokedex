@@ -1,7 +1,11 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   CodexAppServerClient,
   buildSettings,
+  diffResult,
   mapSandboxForAppServer,
   parseUsage,
 } from '../packages/codex-runner/src/index.js';
@@ -318,6 +322,22 @@ const config: AgentConfig = {
   ],
 };
 
+async function withGitWorkspace<T>(run: (root: string) => Promise<T> | T): Promise<T> {
+  mkdirSync(join(process.cwd(), '.npm-cache'), { recursive: true });
+  const root = mkdtempSync(join(process.cwd(), '.npm-cache/pokedex-test-'));
+  try {
+    execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Pokedex Test'], { cwd: root });
+    writeFileSync(join(root, 'tracked.txt'), 'before\n');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: root, stdio: 'ignore' });
+    return await run(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 describe('codex app-server client', () => {
   it('maps sandbox values to app-server config values', () => {
     expect(mapSandboxForAppServer('workspace_write')).toBe('workspace-write');
@@ -480,6 +500,32 @@ describe('codex app-server client', () => {
     expect(parseUsage({ finalMessage: 'not usage' })).toBeNull();
   });
 
+  it('reports staged and untracked files in workspace diffs', async () => {
+    await withGitWorkspace(async (root) => {
+      writeFileSync(join(root, 'tracked.txt'), 'after\n');
+      writeFileSync(join(root, 'staged.txt'), 'staged\n');
+      writeFileSync(join(root, 'untracked.txt'), 'untracked\n');
+      execFileSync('git', ['add', 'staged.txt'], { cwd: root });
+
+      await expect(
+        diffResult(
+          {
+            ...config,
+            workspaces: [{ ...config.workspaces[0]!, root }],
+          },
+          { workspaceAlias: 'repo' }
+        )
+      ).resolves.toMatchObject({
+        ok: true,
+        data: {
+          files: expect.arrayContaining(['tracked.txt', 'staged.txt', 'untracked.txt']),
+          stagedFiles: ['staged.txt'],
+          unstagedFiles: ['tracked.txt'],
+        },
+      });
+    });
+  });
+
   it('starts native threads and collects streamed events', async () => {
     const client = new CodexAppServerClient();
     const seen: unknown[] = [];
@@ -494,6 +540,15 @@ describe('codex app-server client', () => {
     expect(result.finalMessage).toBe('done');
     expect(result.usage.inputTokens).toBe(2);
     expect(seen.length).toBeGreaterThan(0);
+  });
+
+  it('waits for app-server shutdown when closed', async () => {
+    const client = new CodexAppServerClient();
+
+    await expect(
+      client.startThread(config, { workspaceAlias: 'repo', prompt: 'build' })
+    ).resolves.toMatchObject({ threadId: 'thread-1' });
+    await expect(client.close()).resolves.toBeUndefined();
   });
 
   it('supports list, read, resume, fork, goal, review, and interrupt', async () => {
