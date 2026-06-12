@@ -7,6 +7,7 @@ import type {
   ApprovalTarget,
   AgentConfig,
   GoalSet,
+  PluginList,
   ReviewStart,
   RuntimeSettingsSchema,
   SkillList,
@@ -18,6 +19,7 @@ import {
   ApprovalApproveSchema,
   ApprovalTargetSchema,
   GoalSetSchema,
+  PluginListSchema,
   ReviewStartSchema,
   SkillListSchema,
   ThreadIdSchema,
@@ -71,6 +73,22 @@ type ListedSkill = SkillReference & {
   source?: string;
   cwd?: string;
 };
+type ListedPlugin = {
+  name: string;
+  path?: string;
+  description?: string;
+  installed?: boolean;
+  enabled?: boolean;
+  source?: string;
+  marketplace?: string;
+  availability?: string;
+};
+type OptionalEndpointResult = {
+  method: string;
+  result?: unknown;
+  error?: string;
+};
+const turnCompletionTimeoutMs = 570_000;
 
 export type AppServerEvent = {
   method?: string;
@@ -81,6 +99,7 @@ export type AppServerEvent = {
 export type RunnerProgress = {
   event: unknown;
   threadId?: string;
+  turnId?: string;
   finalMessage?: string;
   usage?: Usage;
 };
@@ -99,8 +118,19 @@ export function mapSandboxForAppServer(mode: string): string {
 }
 
 export function parseUsage(value: unknown): Usage | null {
-  const raw = asRecord('usage' in asRecord(value) ? asRecord(value).usage : value);
-  if (!Object.keys(raw).length) return null;
+  const input = asRecord(value);
+  const raw = asRecord('usage' in input ? input.usage : value);
+  const tokenKeys = [
+    'input_tokens',
+    'inputTokens',
+    'cached_input_tokens',
+    'cachedInputTokens',
+    'output_tokens',
+    'outputTokens',
+    'reasoning_output_tokens',
+    'reasoningOutputTokens',
+  ];
+  if (!tokenKeys.some((key) => key in raw)) return null;
 
   return (
     UsageSchema.safeParse({
@@ -199,6 +229,47 @@ export class CodexAppServerClient {
     };
   }
 
+  async listPlugins(config: AgentConfig, input: unknown): Promise<ToolResult> {
+    const args = PluginListSchema.parse(input) satisfies PluginList;
+    const installed = await this.readOptional(config, 'plugin/installed', {});
+    const marketplace = args.includeMarketplace
+      ? await this.readOptional(config, 'plugin/list', {})
+      : undefined;
+    const endpoints = [installed, marketplace].filter(
+      (endpoint): endpoint is OptionalEndpointResult => Boolean(endpoint)
+    );
+    const plugins = uniquePlugins(
+      endpoints.flatMap((endpoint) => normalizePlugins(endpoint.result, endpoint.method))
+    );
+    const errors = endpoints
+      .filter((endpoint) => endpoint.error)
+      .map(({ method, error }) => ({ method, error }));
+
+    return {
+      ok: endpoints.some((endpoint) => !endpoint.error),
+      summary: plugins.length
+        ? `${plugins.length} codex plugin${plugins.length === 1 ? '' : 's'} found.`
+        : errors.length
+          ? 'codex plugin listing is unavailable.'
+          : 'no codex plugins found.',
+      data: stripUndefined({
+        plugins,
+        installed: installed.result,
+        marketplace: marketplace?.result,
+        errors,
+      }),
+    };
+  }
+
+  async readRateLimits(config: AgentConfig): Promise<ToolResult> {
+    const result = await this.request(config, 'account/rateLimits/read', {}, 30_000);
+    return {
+      ok: true,
+      summary: 'codex account rate limits loaded.',
+      data: { result },
+    };
+  }
+
   async startThread(
     config: AgentConfig,
     input: unknown,
@@ -274,7 +345,7 @@ export class CodexAppServerClient {
       return {
         threadId: task.threadId,
         finalMessage: extractFinalMessage(result) || 'turn started.',
-        usage: extractUsage(result) ?? UsageSchema.parse({}),
+        usage: latestUsage([...events, result]) ?? UsageSchema.parse({}),
         events,
       };
     } finally {
@@ -366,7 +437,7 @@ export class CodexAppServerClient {
       return {
         threadId,
         finalMessage: extractFinalMessage(result) || 'review started.',
-        usage: extractUsage(result) ?? UsageSchema.parse({}),
+        usage: latestUsage([...events, result]) ?? UsageSchema.parse({}),
         events,
       };
     } finally {
@@ -417,6 +488,18 @@ export class CodexAppServerClient {
     return await this.sendRequest(method, params, timeoutMs);
   }
 
+  private async readOptional(
+    config: AgentConfig,
+    method: string,
+    params: unknown
+  ): Promise<OptionalEndpointResult> {
+    try {
+      return { method, result: await this.request(config, method, params, 30_000) };
+    } catch (error) {
+      return { method, error: error instanceof Error ? error.message : 'request failed' };
+    }
+  }
+
   private async requestWithApprovalYield(
     config: AgentConfig,
     method: string,
@@ -424,29 +507,65 @@ export class CodexAppServerClient {
     threadId?: string,
     timeoutMs = 120_000
   ): Promise<{ result?: unknown; approval?: PendingApproval }> {
-    let stopWaiting = (): void => {};
+    let turnId: string | undefined;
+    let stopApprovalWaiting = (): void => {};
+    let stopTerminalWaiting = (): void => {};
     const approvalPromise = new Promise<PendingApproval>((resolve) => {
       const existing = this.findApprovalForThread(threadId);
       if (existing) {
         resolve(existing);
         return;
       }
-      stopWaiting = this.onEvent((event) => {
+      stopApprovalWaiting = this.onEvent((event) => {
         const approval = this.approvalFromEvent(event);
         if (!approval || !approvalMatchesThread(approval, threadId)) return;
-        stopWaiting();
+        stopApprovalWaiting();
         resolve(approval);
       });
     });
+    const terminalPromise = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        stopTerminalWaiting();
+        reject(new Error(`codex app-server timeout waiting for ${method} completion`));
+      }, turnCompletionTimeoutMs);
+
+      const stopEvents = this.onEvent((event) => {
+        const terminal = terminalTurnResult(event.raw, threadId, turnId);
+        if (!terminal) return;
+        stopTerminalWaiting();
+        resolve(terminal);
+      });
+      stopTerminalWaiting = () => {
+        clearTimeout(timeout);
+        stopEvents();
+      };
+    });
     const requestPromise = this.request(config, method, params, timeoutMs);
     requestPromise.catch(() => undefined);
+    terminalPromise.catch(() => undefined);
+
     try {
-      return await Promise.race([
-        requestPromise.then((result) => ({ result })),
-        approvalPromise.then((approval) => ({ approval })),
+      const first = await Promise.race([
+        requestPromise.then((result) => ({ kind: 'result' as const, result })),
+        approvalPromise.then((approval) => ({ kind: 'approval' as const, approval })),
+        terminalPromise.then((result) => ({ kind: 'terminal' as const, result })),
       ]);
+
+      if (first.kind === 'approval') return { approval: first.approval };
+      if (first.kind === 'terminal') return { result: first.result };
+
+      turnId = extractTurnId(first.result);
+      if (!turnNeedsTerminalWait(first.result)) return { result: first.result };
+
+      const second = await Promise.race([
+        approvalPromise.then((approval) => ({ kind: 'approval' as const, approval })),
+        terminalPromise.then((result) => ({ kind: 'terminal' as const, result })),
+      ]);
+      if (second.kind === 'approval') return { approval: second.approval };
+      return { result: second.result };
     } finally {
-      stopWaiting();
+      stopApprovalWaiting();
+      stopTerminalWaiting();
     }
   }
 
@@ -518,6 +637,8 @@ export class CodexAppServerClient {
       events.push(redacted);
       const progress: RunnerProgress = { event: redacted };
       if (threadId) progress.threadId = threadId;
+      const turnId = extractTurnId(event.raw);
+      if (turnId) progress.turnId = turnId;
       const finalMessage = extractFinalMessage(event.raw);
       if (finalMessage) progress.finalMessage = finalMessage;
       const usage = extractUsage(event.raw);
@@ -807,7 +928,7 @@ function approvalWaitMessage(approval: PendingApproval): string {
     approval.kind === 'command'
       ? approval.commandText || 'a command'
       : approval.grantRoot || 'file changes';
-  return `codex is waiting for approval ${approval.approvalId}: ${target}. use pokedex_approve or pokedex_decline, then pokedex_read_thread.`;
+  return `codex is waiting for approval: ${target}. inspect pending approvals before asking the user to approve or decline.`;
 }
 
 function approvalMatchesThread(approval: PendingApproval, threadId: string | undefined): boolean {
@@ -816,6 +937,94 @@ function approvalMatchesThread(approval: PendingApproval, threadId: string | und
 
 function defaultSkillRoots(): string[] {
   return [join(homedir(), '.agents', 'skills'), join(homedir(), '.codex', 'skills')];
+}
+
+function normalizePlugins(result: unknown, source: string): ListedPlugin[] {
+  return pluginRecords(result)
+    .map((plugin) => listedPluginFrom(plugin, source))
+    .filter((plugin): plugin is ListedPlugin => Boolean(plugin));
+}
+
+function pluginRecords(value: unknown, depth = 0): unknown[] {
+  if (depth > 5) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => pluginRecords(item, depth + 1));
+  const raw = asRecord(value);
+  if (!Object.keys(raw).length) return [];
+
+  const nested = [
+    'plugins',
+    'installed',
+    'installedPlugins',
+    'items',
+    'entries',
+    'rows',
+    'data',
+    'marketplaceEntries',
+  ].flatMap((key) => pluginRecords(raw[key], depth + 1));
+  return looksLikePlugin(raw) ? [raw, ...nested] : nested;
+}
+
+function listedPluginFrom(value: unknown, source: string): ListedPlugin | null {
+  const raw = asRecord(value);
+  const manifest = asRecord(raw.manifest);
+  const details = asRecord(raw.details);
+  const pluginInterface = asRecord(raw.interface);
+  const name =
+    stringFrom(raw.name) ??
+    stringFrom(raw.displayName) ??
+    stringFrom(raw.title) ??
+    stringFrom(raw.id) ??
+    stringFrom(manifest.name) ??
+    stringFrom(details.name) ??
+    stringFrom(pluginInterface.name);
+  if (!name) return null;
+
+  return stripUndefined({
+    name,
+    path:
+      stringFrom(raw.path) ??
+      stringFrom(raw.uri) ??
+      stringFrom(raw.pluginUri) ??
+      stringFrom(raw.mentionPath) ??
+      stringFrom(raw.installUri) ??
+      stringFrom(manifest.path),
+    description:
+      stringFrom(raw.description) ??
+      stringFrom(manifest.description) ??
+      stringFrom(details.description) ??
+      stringFrom(pluginInterface.description),
+    installed: booleanFrom(raw.installed),
+    enabled: booleanFrom(raw.enabled),
+    source,
+    marketplace:
+      stringFrom(raw.marketplace) ??
+      stringFrom(raw.marketplaceName) ??
+      stringFrom(asRecord(raw.marketplaceEntry).marketplace),
+    availability: stringFrom(raw.availability),
+  }) as ListedPlugin;
+}
+
+function looksLikePlugin(raw: JsonRecord): boolean {
+  return Boolean(
+    stringFrom(raw.path)?.startsWith('plugin://') ||
+    stringFrom(raw.uri)?.startsWith('plugin://') ||
+    stringFrom(raw.pluginUri)?.startsWith('plugin://') ||
+    stringFrom(raw.mentionPath)?.startsWith('plugin://') ||
+    raw.manifest ||
+    raw.interface ||
+    raw.marketplaceEntry ||
+    (raw.id && (raw.name || raw.displayName || raw.title))
+  );
+}
+
+function uniquePlugins(plugins: ListedPlugin[]): ListedPlugin[] {
+  const seen = new Set<string>();
+  return plugins.filter((plugin) => {
+    const key = `${plugin.name}\n${plugin.path ?? ''}\n${plugin.marketplace ?? ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function normalizeSkills(result: unknown, fallbackCwd: string): ListedSkill[] {
@@ -934,12 +1143,32 @@ function asArray(value: unknown): unknown[] {
 
 function extractThreadId(value: unknown): string | undefined {
   const raw = asRecord(value);
+  const params = asRecord(raw.params);
   const thread = asRecord(raw.thread);
+  const paramsThread = asRecord(params.thread);
   return (
     stringFrom(raw.threadId) ??
+    stringFrom(params.threadId) ??
     stringFrom(raw.id) ??
     stringFrom(thread.id) ??
-    stringFrom(thread.threadId)
+    stringFrom(thread.threadId) ??
+    stringFrom(paramsThread.id) ??
+    stringFrom(paramsThread.threadId)
+  );
+}
+
+function extractTurnId(value: unknown): string | undefined {
+  const raw = asRecord(value);
+  const params = asRecord(raw.params);
+  const turn = asRecord(raw.turn);
+  const paramsTurn = asRecord(params.turn);
+  return (
+    stringFrom(raw.turnId) ??
+    stringFrom(params.turnId) ??
+    stringFrom(turn.id) ??
+    stringFrom(turn.turnId) ??
+    stringFrom(paramsTurn.id) ??
+    stringFrom(paramsTurn.turnId)
   );
 }
 
@@ -947,24 +1176,135 @@ function extractFinalMessage(value: unknown): string {
   const raw = asRecord(value);
   const item = asRecord(raw.item);
   const params = asRecord(raw.params);
+  const paramsItem = asRecord(params.item);
+  const turn = asRecord(raw.turn);
+  const paramsTurn = asRecord(params.turn);
   const output = asRecord(raw.output);
+  const paramsOutput = asRecord(params.output);
   return (
     stringFrom(raw.finalMessage) ??
+    stringFrom(raw.finalResponse) ??
     stringFrom(raw.output_text) ??
     stringFrom(output.text) ??
     stringFrom(item.text) ??
+    stringFrom(item.message) ??
+    stringFrom(item.content) ??
+    stringFrom(params.finalMessage) ??
+    stringFrom(params.finalResponse) ??
+    stringFrom(params.output_text) ??
+    stringFrom(paramsOutput.text) ??
     stringFrom(params.text) ??
+    stringFrom(paramsItem.text) ??
+    stringFrom(paramsItem.message) ??
+    stringFrom(paramsItem.content) ??
+    stringFrom(turn.finalMessage) ??
+    stringFrom(turn.finalResponse) ??
+    stringFrom(paramsTurn.finalMessage) ??
+    stringFrom(paramsTurn.finalResponse) ??
     ''
   );
 }
 
 function extractUsage(value: unknown): Usage | null {
   const raw = asRecord(value);
-  return parseUsage(raw.usage) ?? parseUsage(asRecord(raw.params).usage);
+  const params = asRecord(raw.params);
+  const turn = asRecord(raw.turn);
+  const paramsTurn = asRecord(params.turn);
+  const item = asRecord(raw.item);
+  const paramsItem = asRecord(params.item);
+  const candidates = [
+    raw,
+    raw.usage,
+    params,
+    params.usage,
+    turn,
+    turn.usage,
+    paramsTurn,
+    paramsTurn.usage,
+    item,
+    item.usage,
+    paramsItem,
+    paramsItem.usage,
+  ];
+  for (const candidate of candidates) {
+    const usage = parseUsage(candidate);
+    if (usage) return usage;
+  }
+  return null;
+}
+
+function latestUsage(values: unknown[]): Usage | null {
+  let latest: Usage | null = null;
+  for (const value of values) {
+    const usage = extractUsage(value);
+    if (usage && usageTotal(usage) > 0) latest = usage;
+  }
+  return latest;
+}
+
+function terminalTurnResult(
+  value: unknown,
+  threadId: string | undefined,
+  turnId: string | undefined
+): unknown | null {
+  if (!isTerminalTurnEvent(value)) return null;
+  const eventThreadId = extractThreadId(value);
+  if (threadId && eventThreadId && eventThreadId !== threadId) return null;
+  const eventTurnId = extractTurnId(value);
+  if (turnId && eventTurnId && eventTurnId !== turnId) return null;
+  return value;
+}
+
+function isTerminalTurnEvent(value: unknown): boolean {
+  const raw = asRecord(value);
+  const params = asRecord(raw.params);
+  const method = stringFrom(raw.method);
+  const type = stringFrom(raw.type) ?? stringFrom(params.type);
+  const status = turnStatus(value);
+  return (
+    method === 'turn/completed' ||
+    method === 'turn/failed' ||
+    type === 'turn.completed' ||
+    type === 'turn.failed' ||
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'canceled'
+  );
+}
+
+function turnNeedsTerminalWait(value: unknown): boolean {
+  const usage = extractUsage(value);
+  if (extractFinalMessage(value) || (usage && usageTotal(usage) > 0)) return false;
+  const status = turnStatus(value);
+  return (
+    status === 'inProgress' ||
+    status === 'in_progress' ||
+    status === 'running' ||
+    status === 'pending' ||
+    status === 'queued'
+  );
+}
+
+function turnStatus(value: unknown): string | undefined {
+  const raw = asRecord(value);
+  const params = asRecord(raw.params);
+  const turn = asRecord(raw.turn);
+  const paramsTurn = asRecord(params.turn);
+  return (
+    stringFrom(raw.status) ??
+    stringFrom(params.status) ??
+    stringFrom(turn.status) ??
+    stringFrom(paramsTurn.status)
+  );
 }
 
 function stringFrom(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function booleanFrom(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 function stringArrayFrom(value: unknown): string[] | undefined {
@@ -982,6 +1322,12 @@ function numberFrom(value: unknown): number {
   if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value)))
     return Number(value);
   return 0;
+}
+
+function usageTotal(usage: Usage): number {
+  return (
+    usage.inputTokens + usage.cachedInputTokens + usage.outputTokens + usage.reasoningOutputTokens
+  );
 }
 
 function stripUndefined<T extends JsonRecord>(input: T): JsonRecord {

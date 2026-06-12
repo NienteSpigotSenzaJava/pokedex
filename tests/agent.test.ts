@@ -12,6 +12,11 @@ describe('pokedex agent config loading', () => {
     expect(source).toContain("value('--relay-url') ?? saved.relayUrl");
     expect(source).toContain('void codex.warm(config).catch');
     expect(source).toContain("if (toolName === 'pokedex_list_skills')");
+    expect(source).toContain("if (toolName === 'pokedex_list_plugins')");
+    expect(source).toContain(
+      "if (toolName === 'pokedex_get_usage') return await usageResult(config);"
+    );
+    expect(source).toContain('trackRunnerProgress');
     expect(source).toContain(
       'async function dispatch(toolName: string, args: Record<string, unknown>)'
     );

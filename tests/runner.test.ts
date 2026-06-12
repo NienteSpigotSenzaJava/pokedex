@@ -206,6 +206,95 @@ function fakeServerForSkills(): string {
   `;
 }
 
+function fakeServerForPlugins(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "plugin/installed") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          plugins: [{
+            name: "github",
+            path: "plugin://github@openai",
+            description: "GitHub integration",
+            installed: true
+          }]
+        }
+      }));
+    }
+    if (msg.method === "plugin/list") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          entries: [{
+            id: "cloudflare",
+            displayName: "Cloudflare",
+            pluginUri: "plugin://cloudflare@openai",
+            availability: "AVAILABLE"
+          }]
+        }
+      }));
+    }
+  });
+  `;
+}
+
+function fakeServerForAsyncTurn(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: { turn: { id: "turn-async", status: "inProgress", items: [] } }
+      }));
+      setTimeout(() => {
+        console.log(JSON.stringify({
+          method: "turn/completed",
+          params: {
+            threadId: msg.params.threadId,
+            turn: { id: "turn-async", status: "completed" },
+            finalMessage: "async done",
+            usage: { input_tokens: 5, output_tokens: 7 }
+          }
+        }));
+      }, 10);
+    }
+    if (msg.method === "account/rateLimits/read") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: { rateLimits: { primary: { usedPercent: 42, windowDurationMins: 15, resetsAt: 123 } } }
+      }));
+    }
+  });
+  `;
+}
+
 const config: AgentConfig = {
   userId: 'user',
   relayUrl: 'ws://localhost:3000/agent',
@@ -235,7 +324,7 @@ describe('codex app-server client', () => {
   });
 
   it('builds least-privilege runtime settings', () => {
-    expect(buildSettings(config, config.workspaces[0]!, { imagePaths: [] })).toMatchObject({
+    expect(buildSettings(config, config.workspaces[0]!, {})).toMatchObject({
       model: 'gpt-5.5',
       sandbox_mode: 'read-only',
       approval_policy: 'never',
@@ -268,7 +357,7 @@ describe('codex app-server client', () => {
     await expect(
       client.startTurn(approvalConfig, { threadId: 'thread-1', prompt: 'run tests' })
     ).resolves.toMatchObject({
-      finalMessage: expect.stringContaining('approval-1'),
+      finalMessage: expect.stringContaining('codex is waiting for approval: npm test'),
     });
 
     await expect(client.listApprovals()).resolves.toMatchObject({
@@ -323,6 +412,55 @@ describe('codex app-server client', () => {
     client.stop();
   });
 
+  it('lists codex plugins from installed and marketplace app-server endpoints', async () => {
+    const client = new CodexAppServerClient();
+    const pluginConfig = { ...config, appServerArgs: ['-e', fakeServerForPlugins()] };
+
+    await expect(client.listPlugins(pluginConfig, {})).resolves.toMatchObject({
+      ok: true,
+      data: {
+        plugins: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'github',
+            path: 'plugin://github@openai',
+            installed: true,
+          }),
+          expect.objectContaining({
+            name: 'Cloudflare',
+            path: 'plugin://cloudflare@openai',
+            availability: 'AVAILABLE',
+          }),
+        ]),
+      },
+    });
+    client.stop();
+  });
+
+  it('waits for async turn completion events before returning usage', async () => {
+    const client = new CodexAppServerClient();
+    const asyncConfig = { ...config, appServerArgs: ['-e', fakeServerForAsyncTurn()] };
+    const seen: unknown[] = [];
+
+    await expect(
+      client.startTurn(asyncConfig, { threadId: 'thread-1', prompt: 'wait' }, (event) =>
+        seen.push(event)
+      )
+    ).resolves.toMatchObject({
+      finalMessage: 'async done',
+      usage: { inputTokens: 5, outputTokens: 7 },
+    });
+    expect(seen).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ usage: expect.objectContaining({ inputTokens: 5 }) }),
+      ])
+    );
+    await expect(client.readRateLimits(asyncConfig)).resolves.toMatchObject({
+      ok: true,
+      data: { result: { rateLimits: { primary: { usedPercent: 42 } } } },
+    });
+    client.stop();
+  });
+
   it('parses usage shapes', () => {
     expect(
       parseUsage({
@@ -339,6 +477,7 @@ describe('codex app-server client', () => {
       outputTokens: 3,
       reasoningOutputTokens: 4,
     });
+    expect(parseUsage({ finalMessage: 'not usage' })).toBeNull();
   });
 
   it('starts native threads and collects streamed events', async () => {

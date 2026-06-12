@@ -20,7 +20,6 @@ const runtime = {
   sandbox: z.enum(['read_only', 'workspace_write', 'danger_full_access']).optional(),
   approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).optional(),
   webSearch: z.enum(['cached', 'live', 'disabled']).optional(),
-  imagePaths: z.array(z.string()).optional(),
   skillNames: z.array(z.string().min(1)).optional(),
   skills: z.array(z.object({ name: z.string().min(1), path: z.string().min(1) })).optional(),
 };
@@ -28,6 +27,9 @@ const workspace = z.object({ workspaceAlias: z.string().min(1) });
 const skillList = z.object({
   workspaceAlias: z.string().optional(),
   forceReload: z.boolean().optional(),
+});
+const pluginList = z.object({
+  includeMarketplace: z.boolean().optional(),
 });
 const startThread = z.object({
   workspaceAlias: z.string().min(1),
@@ -65,13 +67,15 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'pokedex_list_tasks',
     title: 'list tasks',
-    description: 'list local codex tasks from native threads.',
+    description:
+      'compatibility alias for listing native codex threads. prefer pokedex_list_threads unless the user says task.',
     inputSchema: listThreads,
   },
   {
     name: 'pokedex_list_sessions',
     title: 'list sessions',
-    description: 'list local codex sessions from native threads.',
+    description:
+      'compatibility alias for listing native codex threads. prefer pokedex_list_threads unless the user says session.',
     inputSchema: listThreads,
   },
   {
@@ -89,39 +93,51 @@ export const toolSpecs: ToolSpec[] = [
     inputSchema: skillList,
   },
   {
+    name: 'pokedex_list_plugins',
+    title: 'list plugins',
+    description:
+      'discover codex plugins known to app-server, including installed plugins and marketplace data when available.',
+    inputSchema: pluginList,
+  },
+  {
     name: 'pokedex_start_task',
     title: 'start task',
-    description: 'create a local codex task and send the first user turn.',
+    description:
+      'compatibility alias for starting a native codex thread. prefer pokedex_start_thread.',
     inputSchema: startThread,
   },
   {
     name: 'pokedex_start_thread',
     title: 'start thread',
-    description: 'create a native local codex thread and send the first user turn.',
+    description:
+      'preferred tool for new codex work: create a native local thread and send the first user turn.',
     inputSchema: startThread,
   },
   {
     name: 'pokedex_continue_task',
     title: 'continue task',
-    description: 'send a new turn to an existing local codex task.',
+    description:
+      'compatibility alias for sending a new turn to an existing codex thread. prefer pokedex_send_turn.',
     inputSchema: turn,
   },
   {
     name: 'pokedex_send_turn',
     title: 'send turn',
-    description: 'send a new turn to an existing native codex thread.',
+    description: 'preferred follow-up tool: send a new turn to an existing native codex thread.',
     inputSchema: turn,
   },
   {
     name: 'pokedex_resume_task',
     title: 'resume task',
-    description: 'resume a stored local codex task and send a new turn.',
+    description:
+      'compatibility alias for resuming a stored codex thread. prefer pokedex_resume_thread.',
     inputSchema: turn,
   },
   {
     name: 'pokedex_resume_thread',
     title: 'resume thread',
-    description: 'resume a stored local codex thread and send a new turn.',
+    description:
+      'resume a stored local codex thread and send a new turn, useful after reconnects or list/read lookups.',
     inputSchema: turn,
   },
   {
@@ -151,7 +167,8 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'pokedex_review',
     title: 'review',
-    description: 'start codex review mode on an existing or new native local thread.',
+    description:
+      'start codex review mode on an existing or new native local thread for code review requests.',
     inputSchema: z.object({
       workspaceAlias: z.string().min(1),
       threadId: z.string().optional(),

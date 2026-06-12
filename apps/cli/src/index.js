@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
+import { clearTimeout, setTimeout } from 'node:timers';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -203,7 +204,9 @@ async function startStack({ announceReady = true } = {}) {
   if (announceReady) {
     console.log("✅ Everything's fine, we're ready.\n");
     console.log('Try saying "is pokedex connected?" to your Poke!\n');
-    console.log('Type "help" for commands. Keep this terminal open while you use Poke.\n');
+    console.log(
+      'Type "help" for commands, or just ask your Poke. Keep this terminal open while you use Poke.\n'
+    );
   }
 }
 
@@ -310,7 +313,7 @@ async function waitForAgent() {
 async function waitForPoke() {
   await sleep(1400);
   const child = managedChildren.get('poke')?.child;
-  if (!child || child.exitCode !== null || child.killed)
+  if (!child || childExited(child) || child.killed)
     throw serviceFailure('poke', 'Poke stopped before the tunnel was ready.');
 }
 
@@ -377,7 +380,7 @@ async function handleCommand(parts) {
     return await setEnum('defaultVerbosity', subcommand, ['low', 'medium', 'high']);
   if (name === 'approval' || name === 'approve')
     return await setEnum('defaultApprovalPolicy', subcommand, ['untrusted', 'on-request', 'never']);
-  throw new Error(`Unknown command: ${name}. Type "help" for commands.`);
+  throw new Error(`Unknown command: ${name}. Type "help" for commands, or just ask your Poke.`);
 }
 
 async function setWrite(raw) {
@@ -557,12 +560,14 @@ ${formatCommandHelp(interactiveCommands)}`);
 
 function spawnManaged(name, bin, binArgs) {
   const commandInfo = commandFor(bin);
+  const detached = process.platform !== 'win32';
   const child = spawn(commandInfo.command, [...commandInfo.args, ...binArgs], {
     cwd: invocationCwd,
+    detached,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   });
-  const entry = { child, exitCode: null, signal: null };
+  const entry = { child, detached, exitCode: null, signal: null };
   managedChildren.set(name, entry);
   serviceLogs.set(name, []);
   child.stdout?.setEncoding('utf8');
@@ -580,7 +585,7 @@ function spawnManaged(name, bin, binArgs) {
     statuses[name] = 'down';
     if (!readline) return;
     console.error(
-      `\n⚠️ ${serviceTitle(name)} stopped. Type "status" or "restart"; type "help" for commands.`
+      `\n⚠️ ${serviceTitle(name)} stopped. Type "status" or "restart"; type "help" for commands, or just ask your Poke.`
     );
     readline?.prompt();
   });
@@ -589,7 +594,7 @@ function spawnManaged(name, bin, binArgs) {
 function failIfServiceExited(name, detail) {
   const entry = managedChildren.get(name);
   if (!entry) throw serviceFailure(name, detail);
-  if (entry.child.exitCode !== null || entry.child.killed || statuses[name] === 'error') {
+  if (childExited(entry.child) || entry.child.killed || statuses[name] === 'error') {
     throw serviceFailure(name, detail);
   }
 }
@@ -601,7 +606,7 @@ function serviceFailure(name, detail) {
   const lines = [`⚠️ ${serviceTitle(name)} needs attention.`, serviceHint(name, detail)];
   if (
     !entry ||
-    (entry.child.exitCode === null &&
+    (!childExited(entry.child) &&
       !entry.child.killed &&
       entry.exitCode === null &&
       !entry.signal &&
@@ -635,9 +640,11 @@ function appendLog(name, chunk) {
 
 async function stopStack(final) {
   restarting = !final;
-  for (const entry of managedChildren.values()) entry.child.kill('SIGTERM');
-  const children = [...managedChildren.values()].map((entry) => waitForExit(entry.child));
-  await Promise.all(children);
+  // poke removes the temporary mcp connection from its own signal handler.
+  await stopManagedChild('poke', 'SIGINT', 20_000);
+  await Promise.all(
+    [...managedChildren.keys()].map((name) => stopManagedChild(name, 'SIGTERM', 8_000))
+  );
   managedChildren.clear();
   if (!final) {
     restarting = false;
@@ -655,9 +662,60 @@ async function stopManaged(code) {
   process.exit(code);
 }
 
-function waitForExit(child) {
-  if (child.exitCode !== null) return Promise.resolve();
-  return new Promise((resolveExit) => child.once('exit', resolveExit));
+async function stopManagedChild(name, signal, timeoutMs) {
+  const entry = managedChildren.get(name);
+  if (!entry) return;
+  signalManagedChild(name, entry, signal);
+  if (!(await waitForExit(entry.child, timeoutMs))) {
+    appendLog(name, `${serviceTitle(name)} did not stop in time; forcing shutdown.`);
+    signalManagedChild(name, entry, 'SIGKILL');
+    await waitForExit(entry.child, 2_000);
+  }
+  managedChildren.delete(name);
+}
+
+function signalManagedChild(name, entry, signal) {
+  if (childExited(entry.child)) return;
+  try {
+    if (entry.detached && entry.child.pid) process.kill(-entry.child.pid, signal);
+    else entry.child.kill(signal);
+  } catch (error) {
+    if (error?.code === 'ESRCH') return;
+    if (entry.detached) {
+      try {
+        entry.child.kill(signal);
+        return;
+      } catch (fallbackError) {
+        appendLog(
+          name,
+          `${serviceTitle(name)} ${signal} fallback failed: ${fallbackError.message}`
+        );
+      }
+    }
+    appendLog(name, `${serviceTitle(name)} ${signal} failed: ${error.message}`);
+  }
+}
+
+function waitForExit(child, timeoutMs = 0) {
+  if (childExited(child)) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    let timer;
+    const done = () => {
+      if (timer) clearTimeout(timer);
+      resolveExit(true);
+    };
+    child.once('exit', done);
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        child.off('exit', done);
+        resolveExit(false);
+      }, timeoutMs);
+    }
+  });
+}
+
+function childExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
 }
 
 async function fetchJson(url) {
@@ -976,8 +1034,8 @@ function cleanServiceLine(name, line) {
 function formatError(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (message.startsWith('⚠️') || message.startsWith('✅')) return message;
-  if (message.includes('Type "help" for commands.')) return `⚠️ ${message}`;
-  return `⚠️ ${message}\nType "help" for commands.`;
+  if (message.includes('Type "help" for commands, or just ask your Poke.')) return `⚠️ ${message}`;
+  return `⚠️ ${message}\nType "help" for commands, or just ask your Poke.`;
 }
 
 function formatCommandHelp(commands) {
@@ -1141,8 +1199,16 @@ function randomHex() {
 }
 
 function registerSignals() {
-  process.once('SIGINT', () => void stopManaged(0));
-  process.once('SIGTERM', () => void stopManaged(0));
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.once(signal, () => void stopManaged(0));
+  }
+  process.once('uncaughtException', (error) => void stopAfterFatal(error));
+  process.once('unhandledRejection', (error) => void stopAfterFatal(error));
+}
+
+async function stopAfterFatal(error) {
+  console.error(formatError(error));
+  await stopManaged(1);
 }
 
 function printBanner() {

@@ -28,9 +28,11 @@ describe('pokedex cli', () => {
   it('does not duplicate help guidance for errors that already include it', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain('if (message.includes(\'Type "help" for commands.\'))');
     expect(source).toContain(
-      'throw new Error(`Unknown command: ${name}. Type "help" for commands.`);'
+      'if (message.includes(\'Type "help" for commands, or just ask your Poke.\'))'
+    );
+    expect(source).toContain(
+      'throw new Error(`Unknown command: ${name}. Type "help" for commands, or just ask your Poke.`);'
     );
   });
 
@@ -122,6 +124,21 @@ describe('pokedex cli', () => {
     expect(source).toContain("if (name === 'approval' || name === 'approve')");
     expect(source).toContain('await saveSetting(key, raw);');
     expect(source).toContain("await saveSetting('port', config.port, true);");
+  });
+
+  it('lets the poke tunnel remove its temporary mcp integration before shutdown', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain("await stopManagedChild('poke', 'SIGINT', 20_000);");
+    expect(source).toContain(
+      '// poke removes the temporary mcp connection from its own signal handler.'
+    );
+    expect(source).toContain('process.kill(-entry.child.pid, signal)');
+    expect(source).toContain("for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'])");
+    expect(source).toContain(
+      "process.once('uncaughtException', (error) => void stopAfterFatal(error));"
+    );
+    expect(source).toContain('return child.exitCode !== null || child.signalCode !== null;');
   });
 
   it('makes workspace write on effective immediately and after restart', () => {

@@ -27,12 +27,23 @@ export function redactSecrets(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        /token|secret|password|api[_-]?key/i.test(key) ? '[redacted]' : redactSecrets(item),
+        isSecretKey(key) ? '[redacted]' : redactSecrets(item),
       ])
     );
   }
 
   return value;
+}
+
+function isSecretKey(key: string): boolean {
+  if (
+    /^(input|cached_input|output|reasoning_output|prompt|completion|total)_tokens$/i.test(key) ||
+    /^(input|cachedInput|output|reasoningOutput|prompt|completion|total)Tokens$/.test(key) ||
+    key === 'tokensUsed'
+  ) {
+    return false;
+  }
+  return /token|secret|password|api[_-]?key/i.test(key);
 }
 
 export function parseBearer(header: string | undefined): string | null {

@@ -7,19 +7,40 @@ import WebSocket from 'ws';
 import {
   AgentConfigSchema,
   AgentRequestSchema,
+  UsageSchema,
   parseJsonc,
   type AgentConfig,
   type ToolResult,
+  type Usage,
 } from '@pokedex/protocol';
-import { CodexAppServerClient, capabilitiesResult, diffResult } from '@pokedex/codex-runner';
+import {
+  CodexAppServerClient,
+  capabilitiesResult,
+  diffResult,
+  type RunnerProgress,
+} from '@pokedex/codex-runner';
 import { redactSecrets } from '@pokedex/security';
+
+type UsageSnapshot = {
+  at: string;
+  usage: Usage;
+  totalTokens: number;
+  source: 'event' | 'turn';
+  threadId?: string;
+  turnId?: string;
+};
 
 const logger = pino({ name: 'pokedex-agent', level: 'warn' });
 const configPath = value('--config') ?? existingDefaultConfigPath();
 const codex = new CodexAppServerClient();
 const runtime = {
   reconnectMs: 1000,
-  lastUsage: undefined as ToolResult | undefined,
+  startedAt: new Date().toISOString(),
+  localDate: localDate(),
+  completedTurns: 0,
+  sessionTotal: emptyUsage(),
+  todayTotal: emptyUsage(),
+  lastUsage: undefined as UsageSnapshot | undefined,
 };
 
 process.once('SIGINT', shutdown);
@@ -85,32 +106,53 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_list_sessions') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_threads') return await codex.listThreads(config, args);
   if (toolName === 'pokedex_list_skills') return await codex.listSkills(config, args);
+  if (toolName === 'pokedex_list_plugins') return await codex.listPlugins(config, args);
   if (toolName === 'pokedex_start_task')
-    return runnerResultToTool('codex task started.', await codex.startThread(config, args));
+    return runnerResultToTool(
+      'codex task started.',
+      await codex.startThread(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_start_thread')
-    return runnerResultToTool('codex thread started.', await codex.startThread(config, args));
+    return runnerResultToTool(
+      'codex thread started.',
+      await codex.startThread(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_continue_task')
-    return runnerResultToTool('codex task continued.', await codex.startTurn(config, args));
+    return runnerResultToTool(
+      'codex task continued.',
+      await codex.startTurn(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_send_turn')
-    return runnerResultToTool('codex turn sent.', await codex.startTurn(config, args));
+    return runnerResultToTool(
+      'codex turn sent.',
+      await codex.startTurn(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_resume_task')
-    return runnerResultToTool('codex task resumed.', await codex.resumeThread(config, args));
+    return runnerResultToTool(
+      'codex task resumed.',
+      await codex.resumeThread(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_resume_thread')
-    return runnerResultToTool('codex thread resumed.', await codex.resumeThread(config, args));
+    return runnerResultToTool(
+      'codex thread resumed.',
+      await codex.resumeThread(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_read_thread') return await codex.readThread(config, args);
   if (toolName === 'pokedex_fork_thread') return await codex.forkThread(config, args);
   if (toolName === 'pokedex_set_goal') return await codex.setGoal(config, args);
   if (toolName === 'pokedex_clear_goal') return await codex.clearGoal(config, args);
   if (toolName === 'pokedex_review')
-    return runnerResultToTool('codex review started.', await codex.review(config, args));
+    return runnerResultToTool(
+      'codex review started.',
+      await codex.review(config, args, trackRunnerProgress)
+    );
   if (toolName === 'pokedex_interrupt') return await codex.interrupt(config, args);
   if (toolName === 'pokedex_list_approvals') return await codex.listApprovals();
   if (toolName === 'pokedex_approve') return await codex.approve(args);
   if (toolName === 'pokedex_decline') return await codex.decline(args);
   if (toolName === 'pokedex_cancel_approval') return await codex.cancelApproval(args);
   if (toolName === 'pokedex_get_diff') return await diffResult(config, args);
-  if (toolName === 'pokedex_get_usage')
-    return runtime.lastUsage ?? { ok: false, summary: 'no usage seen yet.', data: {} };
+  if (toolName === 'pokedex_get_usage') return await usageResult(config);
 
   return {
     ok: false,
@@ -142,10 +184,59 @@ function workspaceAccess(
   return 'read only';
 }
 
+async function usageResult(config: AgentConfig): Promise<ToolResult> {
+  resetTodayIfNeeded();
+  const rateLimits = await codex.readRateLimits(config).catch((error: unknown): ToolResult => {
+    return {
+      ok: false,
+      summary: error instanceof Error ? error.message : 'rate limits unavailable',
+      data: { error: redactSecrets(error) },
+    };
+  });
+  const observedTokens = usageTotal(runtime.todayTotal);
+
+  return {
+    ok: Boolean(runtime.lastUsage) || rateLimits.ok,
+    summary: runtime.lastUsage
+      ? `usage loaded. observed today: ${observedTokens} tokens across ${runtime.completedTurns} completed turn${runtime.completedTurns === 1 ? '' : 's'}.`
+      : rateLimits.ok
+        ? 'no token usage events seen yet; account rate limits loaded.'
+        : 'no token usage seen yet.',
+    data: stripUndefined({
+      startedAt: runtime.startedAt,
+      localDate: runtime.localDate,
+      completedTurns: runtime.completedTurns,
+      lastUsage: runtime.lastUsage,
+      sessionTotal: runtime.sessionTotal,
+      todayTotal: runtime.todayTotal,
+      rateLimits: rateLimits.ok ? rateLimits.data.result : undefined,
+      rateLimitError: rateLimits.ok ? undefined : rateLimits.summary,
+    }),
+  };
+}
+
+function trackRunnerProgress(progress: RunnerProgress): void {
+  const usage = usageFrom(progress.usage);
+  if (!usage) return;
+  rememberUsage(usage, {
+    source: 'event',
+    threadId: progress.threadId,
+    turnId: progress.turnId,
+  });
+}
+
 function runnerResultToTool(
   summary: string,
   result: { threadId?: string; finalMessage: string; usage: unknown; events: unknown[] }
 ): ToolResult {
+  const usage = usageFrom(result.usage);
+  if (usage) {
+    rememberUsage(usage, { source: 'turn', threadId: result.threadId });
+    runtime.completedTurns += 1;
+    runtime.sessionTotal = addUsage(runtime.sessionTotal, usage);
+    runtime.todayTotal = addUsage(runtime.todayTotal, usage);
+  }
+
   const toolResult = {
     ok: true,
     summary,
@@ -153,15 +244,74 @@ function runnerResultToTool(
       threadId: result.threadId,
       finalMessage: result.finalMessage,
       usage: result.usage,
-      events: result.events.slice(-50),
     },
   };
-  runtime.lastUsage = {
-    ok: true,
-    summary: 'last usage loaded.',
-    data: { threadId: result.threadId, usage: result.usage },
-  };
   return toolResult;
+}
+
+function rememberUsage(
+  usage: Usage,
+  details: {
+    source: UsageSnapshot['source'];
+    threadId?: string | undefined;
+    turnId?: string | undefined;
+  }
+): void {
+  resetTodayIfNeeded();
+  runtime.lastUsage = stripUndefined({
+    at: new Date().toISOString(),
+    usage,
+    totalTokens: usageTotal(usage),
+    source: details.source,
+    threadId: details.threadId,
+    turnId: details.turnId,
+  }) as UsageSnapshot;
+}
+
+function usageFrom(value: unknown): Usage | null {
+  const parsed = UsageSchema.safeParse(value);
+  if (!parsed.success || usageTotal(parsed.data) === 0) return null;
+  return parsed.data;
+}
+
+function addUsage(left: Usage, right: Usage): Usage {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    cachedInputTokens: left.cachedInputTokens + right.cachedInputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    reasoningOutputTokens: left.reasoningOutputTokens + right.reasoningOutputTokens,
+  };
+}
+
+function usageTotal(usage: Usage): number {
+  return (
+    usage.inputTokens + usage.cachedInputTokens + usage.outputTokens + usage.reasoningOutputTokens
+  );
+}
+
+function emptyUsage(): Usage {
+  return UsageSchema.parse({});
+}
+
+function resetTodayIfNeeded(): void {
+  const today = localDate();
+  if (runtime.localDate === today) return;
+  runtime.localDate = today;
+  runtime.completedTurns = 0;
+  runtime.todayTotal = emptyUsage();
+}
+
+function localDate(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+function pad(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+function stripUndefined(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
 }
 
 function shutdown(): void {

@@ -5,6 +5,7 @@ import {
   mcpToolNames,
   parseJsonc,
   stableCapabilities,
+  toMcpText,
 } from '../packages/protocol/src/index.js';
 import { mcpToolDefinitions, toolSpecs } from '../apps/relay/src/tools.js';
 
@@ -77,9 +78,27 @@ describe('protocol schemas', () => {
     expect(tools.length).toBe(mcpToolNames.length);
     expect(tools.some((tool) => tool.name === 'pokedex_start_task')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_list_skills')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_list_plugins')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_approve')).toBe(true);
     expect(tools.every((tool) => tool.inputSchema && typeof tool.inputSchema === 'object')).toBe(
       true
     );
+  });
+
+  it('formats mcp tool output without raw debug events', () => {
+    const text = toMcpText({
+      ok: true,
+      summary: 'codex thread started.',
+      data: {
+        threadId: 'thread-1',
+        finalMessage: 'done',
+        events: [{ method: 'debug/event' }],
+      },
+    });
+
+    expect(text).toContain('codex thread started.');
+    expect(text).toContain('internal tool state for follow-up only');
+    expect(text).toContain('"threadId": "thread-1"');
+    expect(text).not.toContain('debug/event');
   });
 });

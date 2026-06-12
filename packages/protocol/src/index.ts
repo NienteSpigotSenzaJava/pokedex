@@ -64,7 +64,6 @@ export const RuntimeSettingsSchema = z.object({
   sandbox: SandboxModeSchema.optional(),
   approvalPolicy: ApprovalPolicySchema.optional(),
   webSearch: WebSearchModeSchema.optional(),
-  imagePaths: z.array(z.string()).default([]),
   skillNames: z.array(z.string().min(1)).default([]),
   skills: z.array(z.object({ name: z.string().min(1), path: z.string().min(1) })).default([]),
 });
@@ -124,6 +123,10 @@ export const SkillListSchema = z.object({
   forceReload: z.boolean().default(false),
 });
 
+export const PluginListSchema = z.object({
+  includeMarketplace: z.boolean().default(true),
+});
+
 export type ThreadStart = z.infer<typeof ThreadStartSchema>;
 export type TurnStart = z.infer<typeof TurnStartSchema>;
 export type ThreadList = z.infer<typeof ThreadListSchema>;
@@ -132,6 +135,7 @@ export type ReviewStart = z.infer<typeof ReviewStartSchema>;
 export type ApprovalTarget = z.infer<typeof ApprovalTargetSchema>;
 export type ApprovalApprove = z.infer<typeof ApprovalApproveSchema>;
 export type SkillList = z.infer<typeof SkillListSchema>;
+export type PluginList = z.infer<typeof PluginListSchema>;
 
 export const ToolResultSchema = z.object({
   ok: z.boolean(),
@@ -164,6 +168,7 @@ export const mcpToolNames = [
   'pokedex_list_sessions',
   'pokedex_list_threads',
   'pokedex_list_skills',
+  'pokedex_list_plugins',
   'pokedex_start_task',
   'pokedex_start_thread',
   'pokedex_continue_task',
@@ -234,6 +239,12 @@ export const stableCapabilities: Capability[] = [
     name: 'skills',
     level: 'stable',
     reason: 'app-server skills/list exposes local codex and agents skills',
+    source: 'app_server',
+  },
+  {
+    name: 'plugins',
+    level: 'adapter',
+    reason: 'app-server plugin/list and plugin/installed expose codex plugins when available',
     source: 'app_server',
   },
   {
@@ -345,5 +356,23 @@ function removeTrailingCommas(text: string): string {
 }
 
 export function toMcpText(result: ToolResult): string {
-  return `${result.summary}\n\njson:\n${JSON.stringify(result, null, 2)}`;
+  const data = compactToolData(result.data);
+  const finalMessage =
+    typeof data.finalMessage === 'string' && data.finalMessage ? data.finalMessage : '';
+  return [
+    result.summary,
+    finalMessage ? `codex result: ${finalMessage}` : '',
+    '',
+    'internal tool state for follow-up only. do not show this block to the user unless they explicitly ask for debug details.',
+    'json:',
+    JSON.stringify({ ok: result.ok, data }, null, 2),
+  ]
+    .filter((line, index, lines) => line || lines[index - 1] !== '')
+    .join('\n');
+}
+
+function compactToolData(data: Record<string, unknown>): Record<string, unknown> {
+  const compact = { ...data };
+  delete compact.events;
+  return compact;
 }
