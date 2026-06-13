@@ -18,10 +18,10 @@ describe('pokedex cli', () => {
     expect(output).toContain('~/.pokedex/config.jsonc');
     expect(output).toContain('output [relay|agent|poke]');
     expect(output).toContain('show recent logs for one service or all services');
-    expect(output).toContain('workspace add <alias> <path> [description]');
+    expect(output).toContain('ws add <alias> <path> [description]');
     expect(output).toContain('add or update a workspace');
     expect(output).toContain('write <on|off>');
-    expect(output).toContain('workspace write <alias> <on|off>');
+    expect(output).toContain('ws write <alias> <on|off>');
     expect(output).not.toContain('write [on|off]');
     expect(output).not.toContain('codex <command>');
   });
@@ -195,7 +195,7 @@ describe('pokedex cli', () => {
     expect(source).toContain("parseOnOff(raw, 'write <on|off>')");
     expect(source).toContain("parseOnOff(raw, 'full-access <on|off>')");
     expect(source).toContain('throw new Error(`usage: ${usage}`);');
-    expect(source).toContain('workspace write <alias> <on|off>');
+    expect(source).toContain('ws write <alias> <on|off>');
     expect(source).not.toContain('parseOnOff(raw, !');
     expect(source).not.toContain("if (name === 'codex')");
     expect(source).not.toContain('async function setCodex');

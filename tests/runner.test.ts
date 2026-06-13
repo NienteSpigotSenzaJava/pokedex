@@ -6,6 +6,7 @@ import {
   CodexAppServerClient,
   buildSettings,
   diffResult,
+  gitHeadlessEnv,
   mapSandboxForAppServer,
   parseUsage,
 } from '../packages/codex-runner/src/index.js';
@@ -299,6 +300,59 @@ function fakeServerForAsyncTurn(): string {
   `;
 }
 
+function fakeServerForFailedRateLimitTurn(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rateLimits = {
+    rateLimits: {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: 60,
+        windowDurationMins: 15
+      }
+    }
+  };
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: { turn: { id: "turn-limited", status: "inProgress", items: [] } }
+      }));
+      setTimeout(() => {
+        console.log(JSON.stringify({
+          method: "account/rateLimits/updated",
+          params: rateLimits
+        }));
+        console.log(JSON.stringify({
+          method: "turn/failed",
+          params: {
+            threadId: msg.params.threadId,
+            turn: { id: "turn-limited", status: "failed" },
+            error: { message: "Rate limit reached", code: "rate_limit" }
+          }
+        }));
+      }, 10);
+    }
+    if (msg.method === "account/rateLimits/read") {
+      console.log(JSON.stringify({ id: msg.id, result: rateLimits }));
+    }
+  });
+  `;
+}
+
 const config: AgentConfig = {
   userId: 'user',
   relayUrl: 'ws://localhost:3000/agent',
@@ -349,6 +403,41 @@ describe('codex app-server client', () => {
       sandbox_mode: 'read-only',
       approval_policy: 'never',
     });
+  });
+
+  it('passes non-interactive git credentials to codex processes', () => {
+    const previousGhToken = process.env.GH_TOKEN;
+    const previousGithubToken = process.env.GITHUB_TOKEN;
+    const previousGitConfigCount = process.env.GIT_CONFIG_COUNT;
+    const previousGitConfigKey0 = process.env.GIT_CONFIG_KEY_0;
+    const previousGitConfigValue0 = process.env.GIT_CONFIG_VALUE_0;
+    process.env.GH_TOKEN = 'test-token';
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.GIT_CONFIG_COUNT;
+    delete process.env.GIT_CONFIG_KEY_0;
+    delete process.env.GIT_CONFIG_VALUE_0;
+
+    try {
+      expect(gitHeadlessEnv()).toMatchObject({
+        GH_TOKEN: 'test-token',
+        GITHUB_TOKEN: 'test-token',
+        GCM_INTERACTIVE: 'never',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_KEY_0: 'credential.helper',
+      });
+      expect(gitHeadlessEnv().GIT_CONFIG_VALUE_0).toContain('x-access-token');
+    } finally {
+      if (previousGhToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousGhToken;
+      if (previousGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previousGithubToken;
+      if (previousGitConfigCount === undefined) delete process.env.GIT_CONFIG_COUNT;
+      else process.env.GIT_CONFIG_COUNT = previousGitConfigCount;
+      if (previousGitConfigKey0 === undefined) delete process.env.GIT_CONFIG_KEY_0;
+      else process.env.GIT_CONFIG_KEY_0 = previousGitConfigKey0;
+      if (previousGitConfigValue0 === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+      else process.env.GIT_CONFIG_VALUE_0 = previousGitConfigValue0;
+    }
   });
 
   it('passes changed default approval to later mcp turns without restarting app-server', async () => {
@@ -478,6 +567,34 @@ describe('codex app-server client', () => {
       ok: true,
       data: { result: { rateLimits: { primary: { usedPercent: 42 } } } },
     });
+    client.stop();
+  });
+
+  it('treats failed rate-limit turns as failures and exposes progress diagnostics', async () => {
+    const client = new CodexAppServerClient();
+    const limitedConfig = { ...config, appServerArgs: ['-e', fakeServerForFailedRateLimitTurn()] };
+    const seen: unknown[] = [];
+
+    await expect(
+      client.startTurn(limitedConfig, { threadId: 'thread-1', prompt: 'wait' }, (event) =>
+        seen.push(event)
+      )
+    ).rejects.toThrow(/Rate limit reached/);
+    expect(seen).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventName: 'account/rateLimits/updated',
+          rateLimits: expect.objectContaining({
+            primary: expect.objectContaining({ usedPercent: 100 }),
+          }),
+        }),
+        expect.objectContaining({
+          eventName: 'turn/failed',
+          error: 'Rate limit reached (rate_limit)',
+          status: 'failed',
+        }),
+      ])
+    );
     client.stop();
   });
 

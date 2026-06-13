@@ -82,6 +82,12 @@ describe('protocol schemas', () => {
     expect(tools.some((tool) => tool.name === 'pokedex_read_operation')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_git_check')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_approve')).toBe(true);
+    expect(
+      JSON.stringify(tools.find((tool) => tool.name === 'pokedex_read_operation')?.inputSchema)
+    ).toContain('waitMs');
+    expect(tools.find((tool) => tool.name === 'pokedex_get_usage')?.description).toContain(
+      'rate limits'
+    );
     expect(tools.every((tool) => tool.inputSchema && typeof tool.inputSchema === 'object')).toBe(
       true
     );

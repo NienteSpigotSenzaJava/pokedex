@@ -32,7 +32,11 @@ const skillList = z.object({
 const pluginList = z.object({
   includeMarketplace: z.boolean().optional(),
 });
-const operationTarget = z.object({ operationId: z.string().min(1) });
+const operationTarget = z.object({
+  operationId: z.string().min(1),
+  afterEventsSeen: z.number().int().min(0).optional(),
+  waitMs: z.number().int().min(0).max(30000).optional(),
+});
 const startThread = z.object({
   workspaceAlias: z.string().min(1),
   prompt: z.string().min(1),
@@ -105,14 +109,14 @@ export const toolSpecs: ToolSpec[] = [
     name: 'pokedex_list_operations',
     title: 'list operations',
     description:
-      'list local codex operations that are running or recently completed. use this after reconnects, failed responses, or when the user asks what codex is doing. running means not finished.',
+      'list local codex operations with progress, last event, and rate-limit state. use this after reconnects, failed responses, or when the user asks what codex is doing. running means not finished.',
     inputSchema: empty,
   },
   {
     name: 'pokedex_read_operation',
     title: 'read operation',
     description:
-      'read one tracked long-running codex operation by operationId. use this instead of retrying the same start/send/resume request.',
+      'read one tracked long-running codex operation by operationId. use this instead of retrying the same start/send/resume request. if still running, keep polling now; pass afterEventsSeen from the previous result plus waitMs up to 30000 to wait for the next progress event. do not promise a future update after ending your response.',
     inputSchema: operationTarget,
   },
   {
@@ -126,7 +130,7 @@ export const toolSpecs: ToolSpec[] = [
     name: 'pokedex_start_thread',
     title: 'start thread',
     description:
-      'preferred tool for new codex work: create a native local thread and send the first user turn. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success yet.',
+      'preferred tool for new codex work: create a native local thread and send the first user turn. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success or promise later updates.',
     inputSchema: startThread,
   },
   {
@@ -140,7 +144,7 @@ export const toolSpecs: ToolSpec[] = [
     name: 'pokedex_send_turn',
     title: 'send turn',
     description:
-      'preferred follow-up tool: send a new turn to an existing native codex thread. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success yet.',
+      'preferred follow-up tool: send a new turn to an existing native codex thread. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success or promise later updates.',
     inputSchema: turn,
   },
   {
@@ -154,7 +158,7 @@ export const toolSpecs: ToolSpec[] = [
     name: 'pokedex_resume_thread',
     title: 'resume thread',
     description:
-      'resume a stored local codex thread and send a new turn, useful after reconnects or list/read lookups. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success yet.',
+      'resume a stored local codex thread and send a new turn, useful after reconnects or list/read lookups. if this returns an operationId with operationStatus running, the work is not complete; poll with pokedex_read_operation and do not report success or promise later updates.',
     inputSchema: turn,
   },
   {
@@ -237,13 +241,14 @@ export const toolSpecs: ToolSpec[] = [
     name: 'pokedex_git_check',
     title: 'git check',
     description:
-      'check local git repository state and headless git auth environment for commit and push work. use before asking codex to commit or push.',
+      'check local git repository state and headless git auth environment for commit and push work. use before asking codex to commit or push; set checkRemote true before push/publish/sync requests.',
     inputSchema: gitCheck,
   },
   {
     name: 'pokedex_get_usage',
     title: 'get usage',
-    description: 'return the latest usage seen by the local agent.',
+    description:
+      'return the latest usage plus Codex account rate limits and reset timing when available. use after rate-limit failures or before retrying a limited turn.',
     inputSchema: empty,
   },
 ];

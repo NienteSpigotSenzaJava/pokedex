@@ -17,14 +17,19 @@ describe('pokedex agent config loading', () => {
       "if (toolName === 'pokedex_list_operations') return listOperations();"
     );
     expect(source).toContain(
-      "if (toolName === 'pokedex_read_operation') return readOperation(args);"
+      "if (toolName === 'pokedex_read_operation') return await readOperation(args);"
     );
     expect(source).toContain(
       "if (toolName === 'pokedex_get_usage') return await usageResult(config);"
     );
     expect(source).toContain("if (toolName === 'pokedex_git_check')");
     expect(source).toContain('trackRunnerProgress');
+    expect(source).toContain('trackOperationProgress');
     expect(source).toContain('async function trackOperation');
+    expect(source).toContain('waitForOperationChange');
+    expect(source).toContain('normalizeRateLimitStatus');
+    expect(source).toContain('failureKind');
+    expect(source).toContain('afterEventsSeen');
     expect(source).toContain('use pokedex_read_operation with operationId');
     expect(source).toContain('is not complete yet');
     expect(source).toContain('incomplete: true');

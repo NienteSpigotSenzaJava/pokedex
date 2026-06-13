@@ -4,11 +4,13 @@
 
 🧭 Pokedex connects your local Codex to your Poke.
 
-It runs on your machine, keeps workspace access local, and exposes Codex through a small authenticated MCP relay. Version `0.1.5` focuses on native Codex threads, runtime overrides, plugin discovery, usage visibility, and cleaner shutdown behavior.
+It runs on your machine, keeps workspace access local, and exposes Codex through a small authenticated MCP relay. Version `0.1.5` focuses on native Codex threads, app-server progress streaming, runtime overrides, plugin discovery, usage and rate-limit visibility, and cleaner shutdown behavior.
 
 ```text
 Codex App Server -> Pokedex agent -> Pokedex relay -> Poke Tunnel -> Your Poke
 ```
+
+The Codex runner follows the app-server `initialize`/`initialized` handshake and keeps transport, event parsing, approval requests, settings, skill/plugin discovery, and local git checks in separate modules so progress and failures stay visible to Poke.
 
 ## 🚀 Usage
 
@@ -51,10 +53,10 @@ npx codex-to-poke --workspace /path/to/project
 Inside the prompt:
 
 ```text
-workspace list
-workspace add api /path/to/api
-workspace use api
-workspace write api on
+ws list
+ws add api /path/to/api
+ws use api
+ws write api on
 restart
 ```
 
@@ -66,13 +68,13 @@ config                                      print the saved config with secrets 
 output [relay|agent|poke]                   show recent logs for one service or all services
 write <on|off>                              set write permission for the active workspace
 full-access <on|off>                        set full filesystem access for the active workspace
-workspace list                              show configured workspaces
-workspace add <alias> <path> [description]  add or update a workspace
-workspace remove <alias>                    remove a workspace
-workspace use <alias>                       make a workspace active and restart services
-workspace describe <alias> <description>    change a workspace description
-workspace write <alias> <on|off>            set write permission for one workspace
-workspace full-access <alias> <on|off>      set full access for one workspace
+ws list                                     show configured workspaces
+ws add <alias> <path> [description]         add or update a workspace
+ws remove <alias>                           remove a workspace
+ws use <alias>                              make a workspace active and restart services
+ws describe <alias> <description>           change a workspace description
+ws write <alias> <on|off>                   set write permission for one workspace
+ws full-access <alias> <on|off>             set full access for one workspace
 model <name>                                set the default Codex model
 reasoning minimal|low|medium|high|xhigh     set the default reasoning effort
 verbosity low|medium|high                   set the default answer verbosity
@@ -107,8 +109,8 @@ verbosity low|medium|high
 approval untrusted|on-request|never
 write <on|off>
 full-access <on|off>
-workspace write <alias> <on|off>
-workspace full-access <alias> <on|off>
+ws write <alias> <on|off>
+ws full-access <alias> <on|off>
 ```
 
 The saved defaults live in `~/.pokedex/config.jsonc`. Poke should help the user write these commands, but it should use runtime settings directly when the user wants a one-time override for a Codex turn.
@@ -156,11 +158,11 @@ Use `pokedex_list_skills` to fetch local skills from Codex, including `~/.agents
 
 Use `pokedex_list_plugins` to fetch installed Codex plugins and marketplace plugin data when the local Codex app-server exposes it.
 
-Long-running Codex work is tracked as a local operation. If a start, send, resume, or review call returns an `operationId` with `operationStatus: "running"`, the work is not complete yet. Do not report success and do not retry the same request. Use `pokedex_read_operation` with that `operationId`, or `pokedex_list_operations` after reconnects, failed responses, or when checking what Codex is doing.
+Long-running Codex work is tracked as a local operation. If a start, send, resume, or review call returns an `operationId` with `operationStatus: "running"`, the work is not complete yet. Do not report success and do not retry the same request. Use `pokedex_read_operation` with that `operationId`, or `pokedex_list_operations` after reconnects, failed responses, or when checking what Codex is doing. For live progress, call `pokedex_read_operation` again with the previous `eventsSeen` as `afterEventsSeen` and `waitMs` up to `30000` so Poke waits for the next Codex event instead of promising a later update.
 
-Use `pokedex_get_usage` to inspect observed token usage and account rate-limit data when Codex exposes it through app-server.
+Use `pokedex_get_usage` to inspect observed token usage plus account rate-limit data and reset timing when Codex exposes it through app-server. Rate-limit failures are reported as failed operations with `failureKind: "rate_limit"` and any available reset time.
 
-Use `pokedex_git_check` before commit or push work to verify git identity, remotes, and the headless SSH/GPG/credential environment visible to Pokedex.
+Use `pokedex_git_check` before commit or push work to verify git identity, remotes, and the headless SSH/GPG/credential environment visible to Pokedex. Set `checkRemote: true` for push, publish, or sync-to-GitHub requests.
 
 If Codex pauses for approval, ask Poke to list approvals, then approve or decline the pending request. When only one approval is pending, `pokedex_approve` and `pokedex_decline` do not need an `approvalId`.
 

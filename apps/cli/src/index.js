@@ -36,13 +36,13 @@ const interactiveCommands = [
   ['output [relay|agent|poke]', 'show recent logs for one service or all services'],
   ['write <on|off>', 'set write permission for the active workspace'],
   ['full-access <on|off>', 'set full filesystem access for the active workspace'],
-  ['workspace list', 'show configured workspaces'],
-  ['workspace add <alias> <path> [description]', 'add or update a workspace'],
-  ['workspace remove <alias>', 'remove a workspace'],
-  ['workspace use <alias>', 'make a workspace active and restart services'],
-  ['workspace describe <alias> <description>', 'change a workspace description'],
-  ['workspace write <alias> <on|off>', 'set write permission for one workspace'],
-  ['workspace full-access <alias> <on|off>', 'set full access for one workspace'],
+  ['ws list', 'show configured workspaces'],
+  ['ws add <alias> <path> [description]', 'add or update a workspace'],
+  ['ws remove <alias>', 'remove a workspace'],
+  ['ws use <alias>', 'make a workspace active and restart services'],
+  ['ws describe <alias> <description>', 'change a workspace description'],
+  ['ws write <alias> <on|off>', 'set write permission for one workspace'],
+  ['ws full-access <alias> <on|off>', 'set full access for one workspace'],
   ['model <name>', 'set the default Codex model'],
   ['reasoning minimal|low|medium|high|xhigh', 'set the default reasoning effort'],
   ['verbosity low|medium|high', 'set the default answer verbosity'],
@@ -378,7 +378,7 @@ async function handleCommand(parts) {
   if (name === 'restart') return await restartStack();
   if (name === 'write') return await setWrite(subcommand);
   if (name === 'full-access') return await setFullAccess(subcommand);
-  if (name === 'workspace') return await handleWorkspaceCommand(subcommand, rest);
+  if (name === 'ws' || name === 'workspace') return await handleWorkspaceCommand(subcommand, rest);
   if (name === 'port') return await setPort(subcommand);
   if (name === 'token' && subcommand === 'rotate') return await rotateToken();
   if (name === 'user-id') return await setScalar('userId', subcommand, 'user id', true);
@@ -429,13 +429,13 @@ async function handleWorkspaceCommand(subcommand, rest) {
   if (subcommand === 'write') return await setWorkspaceAccess(rest[0], 'allowWrite', rest[1]);
   if (subcommand === 'full-access')
     return await setWorkspaceAccess(rest[0], 'allowFullAccess', rest[1]);
-  throw new Error('workspace commands: list, add, remove, use, describe, write, full-access');
+  throw new Error('ws commands: list, add, remove, use, describe, write, full-access');
 }
 
 async function addWorkspace(parts) {
   const [alias, root, ...description] = parts;
   assertAlias(alias);
-  if (!root) throw new Error('usage: workspace add <alias> <path> [description]');
+  if (!root) throw new Error('usage: ws add <alias> <path> [description]');
   upsertWorkspace(config.workspaces, {
     alias,
     root: resolveUserPath(root),
@@ -464,16 +464,14 @@ async function useWorkspace(alias) {
 
 async function describeWorkspace(alias, description) {
   assertAlias(alias);
-  if (!description) throw new Error('usage: workspace describe <alias> <description>');
+  if (!description) throw new Error('usage: ws describe <alias> <description>');
   findWorkspace(alias).description = description;
   await saveAndRestart(`workspace ${alias} described`);
 }
 
 async function setWorkspaceAccess(alias, key, raw) {
   const usage =
-    key === 'allowWrite'
-      ? 'workspace write <alias> <on|off>'
-      : 'workspace full-access <alias> <on|off>';
+    key === 'allowWrite' ? 'ws write <alias> <on|off>' : 'ws full-access <alias> <on|off>';
   if (!alias || !raw) throw new Error(`usage: ${usage}`);
   assertAlias(alias);
   const workspace = findWorkspace(alias);
