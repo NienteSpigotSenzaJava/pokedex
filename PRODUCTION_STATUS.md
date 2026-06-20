@@ -42,6 +42,7 @@ NPM:
 - `codex-to-poke@0.1.5` already exists on npm.
 - The package is now prepared as `codex-to-poke@0.1.6`.
 - This machine is not authenticated to npm: `npm whoami` returns `E401 Unauthorized`.
+- A real publish attempt with `npm publish --workspace ./apps/cli --access public` built the package successfully, then npm rejected the upload with `E404 Not Found` / no permission for `codex-to-poke`.
 - Publish is ready to retry after npm authentication with an account that can publish `codex-to-poke`.
 
 Git:
