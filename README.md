@@ -4,7 +4,7 @@
 
 🧭 Pokedex connects your local Codex to your Poke.
 
-It runs on your machine, keeps workspace access local, and exposes Codex through a small authenticated MCP relay. Version `0.1.5` focuses on native Codex threads, app-server progress streaming, runtime overrides, plugin discovery, usage and rate-limit visibility, and cleaner shutdown behavior.
+It runs on your machine, keeps workspace access local, and exposes Codex through a small authenticated MCP relay. Version `0.1.6` focuses on production cleanup, structured git commit/push tools, operation diagnostics, runtime visibility, and a clearer package/module layout.
 
 ```text
 Codex App Server -> Pokedex agent -> Pokedex relay -> Poke Tunnel -> Your Poke
@@ -30,6 +30,8 @@ npx codex-to-poke
 
 When the terminal says it is ready, try saying "is pokedex connected?" to your Poke. Type `help` in the Pokedex prompt to see commands.
 
+Pokedex also works for short SMS-style/offline Poke interactions when your local Pokedex terminal is still running and the tunnel is reachable.
+
 ## 🔐 Permissions
 
 Pokedex starts read-only unless your saved config already allows writes.
@@ -41,6 +43,8 @@ npx codex-to-poke --full-access
 ```
 
 Use `--write` for normal code changes. Use `--full-access` only on machines and projects you trust.
+
+Pokedex command access is separate and disabled by default. Type `shell on` in the Pokedex prompt only if you understand that Poke can change Pokedex settings such as workspaces, workspace permissions, model defaults, and approval policy. This is not a system shell.
 
 ## 🗂️ Workspaces
 
@@ -56,25 +60,25 @@ Inside the prompt:
 ws list
 ws add api /path/to/api
 ws use api
-ws write api on
+ws perms api write
 restart
 ```
+
+Poke should use the public repository <https://github.com/NienteSpigotSenzaJava/pokedex> when it needs to understand Pokedex itself or help diagnose Pokedex bugs. The user's machine does not need a local Pokedex workspace for that.
 
 ## 💬 Prompt Commands
 
 ```text
 status                                      show relay, agent, poke, workspace, and access status
-config                                      print the saved config with secrets hidden
-output [relay|agent|poke]                   show recent logs for one service or all services
-write <on|off>                              set write permission for the active workspace
-full-access <on|off>                        set full filesystem access for the active workspace
+logs [relay|agent|poke]                     show recent logs for one service or all services
+shell <on|off>                              dangerous: allow Poke to run Pokedex prompt commands
 ws list                                     show configured workspaces
 ws add <alias> <path> [description]         add or update a workspace
-ws remove <alias>                           remove a workspace
+ws rm <alias>                               remove a workspace
 ws use <alias>                              make a workspace active and restart services
-ws describe <alias> <description>           change a workspace description
-ws write <alias> <on|off>                   set write permission for one workspace
-ws full-access <alias> <on|off>             set full access for one workspace
+ws desc <alias> <description>               change a workspace description
+ws perms <alias> read-only|write|full-access
+                                            set workspace access
 model <name>                                set the default Codex model
 reasoning minimal|low|medium|high|xhigh     set the default reasoning effort
 verbosity low|medium|high                   set the default answer verbosity
@@ -96,6 +100,10 @@ Pokedex stores config in:
 
 The JSONC config contains the random relay token, default model settings, permissions, and workspace list. Default local wiring such as port `4200`, user `local`, and `codex app-server --listen stdio://` is kept internal unless you override it. If the configured relay port is busy or unavailable, Pokedex automatically tries the next usable local port for that run.
 
+`pokedexCommandsEnabled` is the dangerous command gate behind `pokedex_command`. Keep it `false` unless you want Poke to change Pokedex settings through supported prompt commands.
+
+Pokedex checks the Codex login state before using the local `codex app-server`. If the saved Codex auth changes, Pokedex restarts the app-server so new work uses the current Codex account instead of a stale one.
+
 ## 🎛️ Runtime Settings
 
 Runtime settings are per-request MCP arguments that Poke can pass when it calls Codex tools. They override defaults for one thread, turn, resume, or review request.
@@ -107,13 +115,18 @@ model <name>
 reasoning minimal|low|medium|high|xhigh
 verbosity low|medium|high
 approval untrusted|on-request|never
-write <on|off>
-full-access <on|off>
-ws write <alias> <on|off>
-ws full-access <alias> <on|off>
+ws perms <alias> read-only|write|full-access
 ```
 
 The saved defaults live in `~/.pokedex/config.jsonc`. Poke should help the user write these commands, but it should use runtime settings directly when the user wants a one-time override for a Codex turn.
+
+## 🧵 Codex Threads and Poke Behavior
+
+Pokedex starts non-ephemeral native Codex app-server threads, so Codex writes thread history through its normal local session machinery. Codex desktop/IDE can read that persisted history, but it is not a live subscriber to a Pokedex/Poke turn and may need refresh or resume before recent work appears.
+
+Poke's own wrapper chat is separate from Codex thread history. Poke should use `pokedex_list_threads`, `pokedex_read_thread`, and `pokedex_resume_thread` for recent Codex work instead of assuming IDE/CLI state is live.
+
+Pokedex tool results include effective workspace access and runtime settings such as sandbox mode. If a workspace is `full-access`, the default Codex sandbox is `danger-full-access` unless a request explicitly overrides it.
 
 ## 🧰 MCP Tools
 
@@ -147,7 +160,11 @@ pokedex_decline
 pokedex_cancel_approval
 pokedex_get_diff
 pokedex_git_check
+pokedex_git_commit
+pokedex_git_push
+pokedex_git_commit_push
 pokedex_get_usage
+pokedex_command
 ```
 
 Prefer native thread tools (`pokedex_start_thread`, `pokedex_send_turn`, `pokedex_resume_thread`, and `pokedex_list_threads`). The task and session tools are compatibility aliases for the same thread-backed behavior.
@@ -163,6 +180,10 @@ Long-running Codex work is tracked as a local operation. If a start, send, resum
 Use `pokedex_get_usage` to inspect observed token usage plus account rate-limit data and reset timing when Codex exposes it through app-server. Rate-limit failures are reported as failed operations with `failureKind: "rate_limit"` and any available reset time.
 
 Use `pokedex_git_check` before commit or push work to verify git identity, remotes, and the headless SSH/GPG/credential environment visible to Pokedex. Set `checkRemote: true` for push, publish, or sync-to-GitHub requests.
+
+Use `pokedex_git_commit`, `pokedex_git_push`, and `pokedex_git_commit_push` for structured local git writes instead of asking Codex to run shell commands. Commits require an explicit message. Pushes require effective `full-access` and use the headless git credentials visible to Pokedex.
+
+Use `pokedex_command` only after enabling `shell on` in the Pokedex prompt. It applies supported Pokedex prompt commands such as `status`, `shell`, `ws add`, `ws rm`, `ws use`, `ws desc`, `ws perms`, `model`, `reasoning`, `verbosity`, and `approval`. It does not run OS shell commands.
 
 If Codex pauses for approval, ask Poke to list approvals, then approve or decline the pending request. When only one approval is pending, `pokedex_approve` and `pokedex_decline` do not need an `approvalId`.
 
@@ -187,6 +208,8 @@ npx codex-to-poke --port 4201
 ```
 
 Inside Pokedex, use `help` for a list of available commands.
+
+If the Poke tunnel stops, Pokedex closes the local relay and Codex agent too. That frees the MCP port instead of leaving a half-running stack. Type `restart` in the Pokedex prompt to start the full stack again.
 
 ## 🖥️ Platform Support
 

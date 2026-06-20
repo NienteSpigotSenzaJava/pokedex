@@ -1,12 +1,17 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   CodexAppServerClient,
   buildSettings,
   diffResult,
+  gitCheckResult,
+  gitCommitPushResult,
+  gitCommitResult,
   gitHeadlessEnv,
+  gitPushResult,
   mapSandboxForAppServer,
   parseUsage,
 } from '../packages/codex-runner/src/index.js';
@@ -27,7 +32,13 @@ rl.on("line", (line) => {
     console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
     return;
   }
-  if (msg.method === "thread/start") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-1" } } }));
+  if (msg.method === "thread/start") {
+    if (msg.params.ephemeral !== false) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32602, message: "thread is not persistent" } }));
+      return;
+    }
+    console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-1" } } }));
+  }
   if (msg.method === "turn/start") {
     const textItem = msg.params.input.find((item) => item.type === "text");
     const badSkill = msg.params.input.some((item) => item.type === "skill" && (!item.name || !item.path));
@@ -39,7 +50,7 @@ rl.on("line", (line) => {
     console.log(JSON.stringify({ id: msg.id, result: { finalMessage: "done", usage: { input_tokens: 2 } } }));
   }
   if (msg.method === "thread/resume") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: msg.params.threadId } } }));
-  if (msg.method === "thread/list") console.log(JSON.stringify({ id: msg.id, result: { threads: [{ id: "thread-1" }], cursor: null } }));
+  if (msg.method === "thread/list") console.log(JSON.stringify({ id: msg.id, result: { threads: [{ id: "thread-1", cwd: msg.params.cwd }], cursor: null } }));
   if (msg.method === "thread/read") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: msg.params.threadId }, turns: [] } }));
   if (msg.method === "thread/fork") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-2", forkedFromId: msg.params.threadId } } }));
   if (msg.method === "thread/goal/set") console.log(JSON.stringify({ id: msg.id, result: { ok: true } }));
@@ -48,6 +59,9 @@ rl.on("line", (line) => {
   if (msg.method === "turn/interrupt") console.log(JSON.stringify({ id: msg.id, result: { ok: true } }));
 });
 `;
+const transportPath = fileURLToPath(
+  new URL('../packages/codex-runner/src/transport.ts', import.meta.url)
+);
 
 function fakeServerForMessage(finalMessage: string): string {
   return `
@@ -65,7 +79,13 @@ function fakeServerForMessage(finalMessage: string): string {
       console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
       return;
     }
-    if (msg.method === "thread/start") console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-1" } } }));
+    if (msg.method === "thread/start") {
+      if (msg.params.ephemeral !== false) {
+        console.log(JSON.stringify({ id: msg.id, error: { code: -32602, message: "thread is not persistent" } }));
+        return;
+      }
+      console.log(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-1" } } }));
+    }
     if (msg.method === "turn/start") console.log(JSON.stringify({ id: msg.id, result: { finalMessage: ${JSON.stringify(
       finalMessage
     )}, usage: { input_tokens: 2 } } }));
@@ -94,6 +114,35 @@ function fakeServerForTurnSettings(): string {
         id: msg.id,
         result: {
           finalMessage: msg.params.settings.approval_policy,
+          usage: { input_tokens: 1 }
+        }
+      }));
+    }
+  });
+  `;
+}
+
+function fakeServerForRuntimeSettings(): string {
+  return `
+  const readline = require("node:readline");
+  let initialized = false;
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      initialized = true;
+      console.log(JSON.stringify({ id: msg.id, result: { userAgent: "fake-codex" } }));
+      return;
+    }
+    if (!initialized) {
+      console.log(JSON.stringify({ id: msg.id, error: { code: -32600, message: "Not initialized" } }));
+      return;
+    }
+    if (msg.method === "turn/start") {
+      console.log(JSON.stringify({
+        id: msg.id,
+        result: {
+          finalMessage: msg.params.settings.sandbox_mode + ":" + msg.params.settings.approval_policy,
           usage: { input_tokens: 1 }
         }
       }));
@@ -365,6 +414,7 @@ const config: AgentConfig = {
   defaultApprovalPolicy: 'never',
   writeTasksEnabled: false,
   fullAccessEnabled: false,
+  pokedexCommandsEnabled: false,
   workspaces: [
     {
       alias: 'repo',
@@ -403,6 +453,54 @@ describe('codex app-server client', () => {
       sandbox_mode: 'read-only',
       approval_policy: 'never',
     });
+  });
+
+  it('derives the default sandbox from effective workspace access', () => {
+    const fullAccessConfig: AgentConfig = {
+      ...config,
+      writeTasksEnabled: true,
+      fullAccessEnabled: true,
+      workspaces: [
+        {
+          ...config.workspaces[0]!,
+          allowWrite: true,
+          allowFullAccess: true,
+          defaultSandbox: 'read_only',
+        },
+      ],
+    };
+
+    expect(buildSettings(fullAccessConfig, fullAccessConfig.workspaces[0]!, {})).toMatchObject({
+      sandbox_mode: 'danger-full-access',
+    });
+    expect(
+      buildSettings(fullAccessConfig, fullAccessConfig.workspaces[0]!, { sandbox: 'read_only' })
+    ).toMatchObject({
+      sandbox_mode: 'read-only',
+    });
+  });
+
+  it('passes workspace sandbox settings to later mcp turns', async () => {
+    const client = new CodexAppServerClient();
+    const fullAccessConfig: AgentConfig = {
+      ...config,
+      appServerArgs: ['-e', fakeServerForRuntimeSettings()],
+      writeTasksEnabled: true,
+      fullAccessEnabled: true,
+      workspaces: [
+        {
+          ...config.workspaces[0]!,
+          allowWrite: true,
+          allowFullAccess: true,
+          defaultSandbox: 'danger_full_access',
+        },
+      ],
+    };
+
+    await expect(
+      client.startTurn(fullAccessConfig, { threadId: 'thread-1', prompt: 'run build' })
+    ).resolves.toMatchObject({ finalMessage: 'danger-full-access:never' });
+    client.stop();
   });
 
   it('passes non-interactive git credentials to codex processes', () => {
@@ -477,6 +575,8 @@ describe('codex app-server client', () => {
             approvalId: 'approval-1',
             commandText: 'npm test',
             cwd: '/tmp/repo',
+            recommendedDecision: 'acceptForSession',
+            recommendedDecisionReason: expect.stringContaining('repeated matching approvals'),
           }),
         ],
       },
@@ -643,6 +743,215 @@ describe('codex app-server client', () => {
     });
   });
 
+  it('blocks commit and push checks for read-only workspaces', async () => {
+    await withGitWorkspace(async (root) => {
+      await expect(
+        gitCheckResult(
+          {
+            ...config,
+            workspaces: [{ ...config.workspaces[0]!, root }],
+          },
+          { workspaceAlias: 'repo' }
+        )
+      ).resolves.toMatchObject({
+        ok: false,
+        data: {
+          access: 'read-only',
+          issues: expect.arrayContaining([
+            'workspace is read-only; commit/push needs write access',
+          ]),
+          nextAction: expect.stringContaining('ws perms repo write'),
+        },
+      });
+    });
+  });
+
+  it('requires full access before remote git checks for push work', async () => {
+    await withGitWorkspace(async (root) => {
+      await expect(
+        gitCheckResult(
+          {
+            ...config,
+            writeTasksEnabled: true,
+            workspaces: [
+              {
+                ...config.workspaces[0]!,
+                root,
+                allowWrite: true,
+                defaultSandbox: 'workspace_write',
+              },
+            ],
+          },
+          { workspaceAlias: 'repo', checkRemote: true }
+        )
+      ).resolves.toMatchObject({
+        ok: false,
+        data: {
+          access: 'write',
+          issues: expect.arrayContaining([
+            'workspace does not have full access; push/publish/sync needs full-access',
+          ]),
+          nextAction: expect.stringContaining('ws perms repo full-access'),
+        },
+      });
+    });
+  });
+
+  it('creates local commits through the structured git commit tool', async () => {
+    await withGitWorkspace(async (root) => {
+      writeFileSync(join(root, 'tracked.txt'), 'after\n');
+      const writeConfig: AgentConfig = {
+        ...config,
+        writeTasksEnabled: true,
+        workspaces: [
+          {
+            ...config.workspaces[0]!,
+            root,
+            allowWrite: true,
+            defaultSandbox: 'workspace_write',
+          },
+        ],
+      };
+
+      await expect(
+        gitCommitResult(writeConfig, {
+          workspaceAlias: 'repo',
+          message: 'update tracked file',
+          stage: 'all',
+        })
+      ).resolves.toMatchObject({
+        ok: true,
+        data: {
+          message: 'update tracked file',
+          committedFiles: ['tracked.txt'],
+        },
+      });
+      expect(
+        execFileSync('git', ['log', '-1', '--pretty=%s'], { cwd: root, encoding: 'utf8' }).trim()
+      ).toBe('update tracked file');
+      expect(execFileSync('git', ['status', '--short'], { cwd: root, encoding: 'utf8' })).toBe('');
+    });
+  });
+
+  it('blocks structured commits when the workspace is read-only', async () => {
+    await withGitWorkspace(async (root) => {
+      writeFileSync(join(root, 'tracked.txt'), 'after\n');
+
+      await expect(
+        gitCommitResult(
+          {
+            ...config,
+            workspaces: [{ ...config.workspaces[0]!, root }],
+          },
+          {
+            workspaceAlias: 'repo',
+            message: 'update tracked file',
+            stage: 'all',
+          }
+        )
+      ).resolves.toMatchObject({
+        ok: false,
+        data: {
+          issues: expect.arrayContaining([
+            'workspace is read-only; commit/push needs write access',
+          ]),
+        },
+      });
+    });
+  });
+
+  it('creates a commit and pushes it through the structured git tool', async () => {
+    await withGitWorkspace(async (root) => {
+      const remote = mkdtempSync(join(process.cwd(), '.npm-cache/pokedex-remote-'));
+      try {
+        execFileSync('git', ['init', '--bare'], { cwd: remote, stdio: 'ignore' });
+        execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: root });
+        writeFileSync(join(root, 'tracked.txt'), 'after\n');
+        const fullAccessConfig: AgentConfig = {
+          ...config,
+          writeTasksEnabled: true,
+          fullAccessEnabled: true,
+          workspaces: [
+            {
+              ...config.workspaces[0]!,
+              root,
+              allowWrite: true,
+              allowFullAccess: true,
+              defaultSandbox: 'danger_full_access',
+            },
+          ],
+        };
+
+        await expect(
+          gitCommitPushResult(fullAccessConfig, {
+            workspaceAlias: 'repo',
+            message: 'push tracked update',
+            stage: 'all',
+            remote: 'origin',
+            branch: 'HEAD',
+          })
+        ).resolves.toMatchObject({
+          ok: true,
+          data: {
+            commit: expect.objectContaining({
+              message: 'push tracked update',
+            }),
+            push: expect.objectContaining({
+              remote: 'origin',
+              branch: 'HEAD',
+            }),
+          },
+        });
+        expect(
+          execFileSync('git', ['--git-dir', remote, 'log', '-1', '--all', '--pretty=%s'], {
+            encoding: 'utf8',
+          }).trim()
+        ).toBe('push tracked update');
+      } finally {
+        rmSync(remote, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('blocks structured pushes without full access', async () => {
+    await withGitWorkspace(async (root) => {
+      const remote = mkdtempSync(join(process.cwd(), '.npm-cache/pokedex-remote-'));
+      try {
+        execFileSync('git', ['init', '--bare'], { cwd: remote, stdio: 'ignore' });
+        execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: root });
+        const writeConfig: AgentConfig = {
+          ...config,
+          writeTasksEnabled: true,
+          workspaces: [
+            {
+              ...config.workspaces[0]!,
+              root,
+              allowWrite: true,
+              defaultSandbox: 'workspace_write',
+            },
+          ],
+        };
+
+        await expect(
+          gitPushResult(writeConfig, {
+            workspaceAlias: 'repo',
+            remote: 'origin',
+            branch: 'HEAD',
+          })
+        ).resolves.toMatchObject({
+          ok: false,
+          data: {
+            issues: expect.arrayContaining([
+              'workspace does not have full access; push/publish/sync needs full-access',
+            ]),
+          },
+        });
+      } finally {
+        rmSync(remote, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('starts native threads and collects streamed events', async () => {
     const client = new CodexAppServerClient();
     const seen: unknown[] = [];
@@ -656,7 +965,24 @@ describe('codex app-server client', () => {
     expect(result.threadId).toBe('thread-1');
     expect(result.finalMessage).toBe('done');
     expect(result.usage.inputTokens).toBe(2);
+    expect(result.workspaceAlias).toBe('repo');
+    expect(result.cwd).toBe(config.workspaces[0]?.root);
+    expect(result.settings?.sandbox_mode).toBe('read-only');
     expect(seen.length).toBeGreaterThan(0);
+  });
+
+  it('requires workspaceAlias before sending turns for uncached threads', async () => {
+    const client = new CodexAppServerClient();
+    await expect(
+      client.startTurn(
+        {
+          ...config,
+          workspaces: [...config.workspaces, { ...config.workspaces[0]!, alias: 'api' }],
+        },
+        { threadId: 'thread-unknown', prompt: 'next' }
+      )
+    ).rejects.toThrow('workspaceAlias is required');
+    client.stop();
   });
 
   it('waits for app-server shutdown when closed', async () => {
@@ -727,5 +1053,17 @@ describe('codex app-server client', () => {
       finalMessage: 'second',
     });
     client.stop();
+  });
+
+  it('includes codex auth state in the app-server identity', () => {
+    const source = readFileSync(transportPath, 'utf8');
+
+    expect(source).toContain('codexAuthFingerprint(config)');
+    expect(source).toContain("['login', 'status']");
+    expect(source).toContain(
+      "join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json')"
+    );
+    expect(source).toContain('file metadata is enough to invalidate stale app-server auth');
+    expect(source).toContain('tracksCodexAuth(config.appServerCommand)');
   });
 });

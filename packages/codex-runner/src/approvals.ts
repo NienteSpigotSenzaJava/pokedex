@@ -117,6 +117,8 @@ export function publicApproval(approval: PendingApproval): JsonRecord {
     cwd: approval.cwd,
     grantRoot: approval.grantRoot,
     availableDecisions: approval.availableDecisions,
+    recommendedDecision: recommendedApprovalDecision(approval),
+    recommendedDecisionReason: recommendedApprovalDecisionReason(approval),
     createdAt: approval.createdAt,
   });
 }
@@ -134,4 +136,13 @@ export function approvalMatchesThread(
   threadId: string | undefined
 ): boolean {
   return !threadId || !approval.threadId || approval.threadId === threadId;
+}
+
+function recommendedApprovalDecision(approval: PendingApproval): ApprovalDecision | undefined {
+  return approval.availableDecisions?.includes('acceptForSession') ? 'acceptForSession' : undefined;
+}
+
+function recommendedApprovalDecisionReason(approval: PendingApproval): string | undefined {
+  if (recommendedApprovalDecision(approval) !== 'acceptForSession') return undefined;
+  return 'acceptForSession is available for repeated matching approvals in this chat.';
 }

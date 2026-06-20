@@ -16,7 +16,11 @@ export function buildSettings(
   workspace: Workspace,
   task: RuntimeSettings
 ): JsonRecord {
-  const sandbox = assertSandboxAllowed(config, workspace, task.sandbox ?? workspace.defaultSandbox);
+  const sandbox = assertSandboxAllowed(
+    config,
+    workspace,
+    task.sandbox ?? sandboxForWorkspaceAccess(config, workspace)
+  );
   return stripUndefined({
     model: task.model ?? config.defaultModel,
     profile: task.profile,
@@ -26,4 +30,13 @@ export function buildSettings(
     sandbox_mode: mapSandboxForAppServer(sandbox),
     web_search: task.webSearch,
   });
+}
+
+function sandboxForWorkspaceAccess(
+  config: AgentConfig,
+  workspace: Workspace
+): Workspace['defaultSandbox'] {
+  if (config.fullAccessEnabled && workspace.allowFullAccess) return 'danger_full_access';
+  if (config.writeTasksEnabled && workspace.allowWrite) return 'workspace_write';
+  return 'read_only';
 }

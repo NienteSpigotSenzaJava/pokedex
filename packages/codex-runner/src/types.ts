@@ -30,4 +30,7 @@ export type RunnerResult = {
   finalMessage: string;
   usage: Usage;
   events: unknown[];
+  cwd?: string;
+  workspaceAlias?: string;
+  settings?: JsonRecord;
 };

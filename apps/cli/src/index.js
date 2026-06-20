@@ -25,6 +25,7 @@ const defaultPortLabel = '4200';
 const portScanLimit = 100;
 const unprivilegedPortStart = 1024;
 const managedShutdownPollMs = 50;
+const relayPortCloseTimeoutMs = 2_000;
 const bannerText = [
   '▄▄▄▄   ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄ ▄▄▄▄  ▄▄▄▄▄ ▄▄ ▄▄ ',
   '██▄█▀ ██▀██ ██▄█▀ ██▄▄  ██▀██ ██▄▄  ▀█▄█▀ ',
@@ -32,17 +33,14 @@ const bannerText = [
 ].join('\n');
 const interactiveCommands = [
   ['status', 'show relay, agent, poke, workspace, and access status'],
-  ['config', 'print the saved config with secrets hidden'],
-  ['output [relay|agent|poke]', 'show recent logs for one service or all services'],
-  ['write <on|off>', 'set write permission for the active workspace'],
-  ['full-access <on|off>', 'set full filesystem access for the active workspace'],
+  ['logs [relay|agent|poke]', 'show recent logs for one service or all services'],
+  ['shell <on|off>', 'dangerous: allow Poke to run Pokedex prompt commands'],
   ['ws list', 'show configured workspaces'],
   ['ws add <alias> <path> [description]', 'add or update a workspace'],
-  ['ws remove <alias>', 'remove a workspace'],
+  ['ws rm <alias>', 'remove a workspace'],
   ['ws use <alias>', 'make a workspace active and restart services'],
-  ['ws describe <alias> <description>', 'change a workspace description'],
-  ['ws write <alias> <on|off>', 'set write permission for one workspace'],
-  ['ws full-access <alias> <on|off>', 'set full access for one workspace'],
+  ['ws desc <alias> <description>', 'change a workspace description'],
+  ['ws perms <alias> read-only|write|full-access', 'set workspace access'],
   ['model <name>', 'set the default Codex model'],
   ['reasoning minimal|low|medium|high|xhigh', 'set the default reasoning effort'],
   ['verbosity low|medium|high', 'set the default answer verbosity'],
@@ -59,6 +57,7 @@ let configuredRelayPort = '';
 let readline = null;
 let stopping = false;
 let restarting = false;
+let closingAfterServiceExit = false;
 
 if (command === 'help') help();
 else if (command === 'local') await local();
@@ -148,6 +147,7 @@ function createConfig(saved) {
     defaultApprovalPolicy: value('--approval') ?? saved.defaultApprovalPolicy ?? 'never',
     writeTasksEnabled: writeEnabled,
     fullAccessEnabled: fullAccess,
+    pokedexCommandsEnabled: Boolean(saved.pokedexCommandsEnabled),
     workspaces,
   };
 }
@@ -370,18 +370,17 @@ async function runConsoleCommand(line) {
 async function handleCommand(parts) {
   const [name, subcommand, ...rest] = parts;
   if (!name) return printStatus();
-  if (['q', 'quit', 'exit'].includes(name)) return await stopManaged(0);
+  if (name === 'quit') return await stopManaged(0);
   if (name === 'help') return printInteractiveHelp();
   if (name === 'status') return printStatus();
-  if (name === 'config') return printConfig();
-  if (name === 'output') return printServiceOutput(subcommand);
+  if (name === 'logs') return printServiceLogs(subcommand);
   if (name === 'restart') return await restartStack();
-  if (name === 'write') return await setWrite(subcommand);
-  if (name === 'full-access') return await setFullAccess(subcommand);
-  if (name === 'ws' || name === 'workspace') return await handleWorkspaceCommand(subcommand, rest);
+  if (name === 'shell') return await setShell(subcommand);
+  if (name === 'write' || name === 'full-access')
+    throw new Error('use `ws perms <alias> read-only|write|full-access` instead');
+  if (name === 'ws') return await handleWorkspaceCommand(subcommand, rest);
   if (name === 'port') return await setPort(subcommand);
   if (name === 'token' && subcommand === 'rotate') return await rotateToken();
-  if (name === 'user-id') return await setScalar('userId', subcommand, 'user id', true);
   if (name === 'model') return await setScalar('defaultModel', subcommand, 'model');
   if (name === 'reasoning')
     return await setEnum('defaultReasoning', subcommand, [
@@ -393,43 +392,32 @@ async function handleCommand(parts) {
     ]);
   if (name === 'verbosity')
     return await setEnum('defaultVerbosity', subcommand, ['low', 'medium', 'high']);
-  if (name === 'approval' || name === 'approve')
+  if (name === 'approval')
     return await setEnum('defaultApprovalPolicy', subcommand, ['untrusted', 'on-request', 'never']);
   throw new Error(`Unknown command: ${name}. Type "help" for commands, or just ask your Poke.`);
 }
 
-async function setWrite(raw) {
-  const enabled = parseOnOff(raw, 'write <on|off>');
-  config.writeTasksEnabled = enabled;
-  activeWorkspace().allowWrite = enabled;
-  if (!enabled) {
-    config.fullAccessEnabled = false;
-    activeWorkspace().allowFullAccess = false;
+async function setShell(raw) {
+  const enabled = parseOnOff(raw, 'shell <on|off>');
+  config.pokedexCommandsEnabled = enabled;
+  if (enabled) {
+    console.log(
+      'WARNING: this lets Poke change Pokedex settings such as workspaces and permissions. Only enable it if you trust the current Poke session.'
+    );
   }
-  syncWorkspaceSandbox(activeWorkspace());
-  await saveSetting('writeTasksEnabled', enabled ? 'on' : 'off');
-}
-
-async function setFullAccess(raw) {
-  const enabled = parseOnOff(raw, 'full-access <on|off>');
-  config.fullAccessEnabled = enabled;
-  config.writeTasksEnabled = enabled || config.writeTasksEnabled;
-  activeWorkspace().allowFullAccess = enabled;
-  activeWorkspace().allowWrite = enabled || activeWorkspace().allowWrite;
-  syncWorkspaceSandbox(activeWorkspace());
-  await saveSetting('fullAccessEnabled', enabled ? 'on' : 'off');
+  await saveSetting('pokedexCommandsEnabled', enabled ? 'on' : 'off');
 }
 
 async function handleWorkspaceCommand(subcommand, rest) {
   if (subcommand === 'list' || !subcommand) return printWorkspaces();
   if (subcommand === 'add') return await addWorkspace(rest);
-  if (subcommand === 'remove') return await removeWorkspace(rest[0]);
+  if (subcommand === 'rm') return await removeWorkspace(rest[0]);
   if (subcommand === 'use') return await useWorkspace(rest[0]);
-  if (subcommand === 'describe') return await describeWorkspace(rest[0], rest.slice(1).join(' '));
-  if (subcommand === 'write') return await setWorkspaceAccess(rest[0], 'allowWrite', rest[1]);
-  if (subcommand === 'full-access')
-    return await setWorkspaceAccess(rest[0], 'allowFullAccess', rest[1]);
-  throw new Error('ws commands: list, add, remove, use, describe, write, full-access');
+  if (subcommand === 'desc') return await describeWorkspace(rest[0], rest.slice(1).join(' '));
+  if (subcommand === 'perms') return await setWorkspacePermissions(rest[0], rest[1]);
+  if (subcommand === 'write' || subcommand === 'full-access')
+    throw new Error('use `ws perms <alias> read-only|write|full-access` instead');
+  throw new Error('ws commands: list, add, rm, use, desc, perms');
 }
 
 async function addWorkspace(parts) {
@@ -452,6 +440,7 @@ async function removeWorkspace(alias) {
   if (config.workspaces.length === 1) throw new Error('cannot remove the last workspace');
   findWorkspace(alias);
   config.workspaces = config.workspaces.filter((workspace) => workspace.alias !== alias);
+  syncGlobalAccessGates();
   await saveAndRestart(`workspace ${alias} removed`);
 }
 
@@ -464,27 +453,22 @@ async function useWorkspace(alias) {
 
 async function describeWorkspace(alias, description) {
   assertAlias(alias);
-  if (!description) throw new Error('usage: ws describe <alias> <description>');
+  if (!description) throw new Error('usage: ws desc <alias> <description>');
   findWorkspace(alias).description = description;
   await saveAndRestart(`workspace ${alias} described`);
 }
 
-async function setWorkspaceAccess(alias, key, raw) {
-  const usage =
-    key === 'allowWrite' ? 'ws write <alias> <on|off>' : 'ws full-access <alias> <on|off>';
+async function setWorkspacePermissions(alias, raw) {
+  const usage = 'ws perms <alias> read-only|write|full-access';
   if (!alias || !raw) throw new Error(`usage: ${usage}`);
   assertAlias(alias);
   const workspace = findWorkspace(alias);
-  workspace[key] = parseOnOff(raw, usage);
-  if (key === 'allowWrite' && workspace[key]) config.writeTasksEnabled = true;
-  if (key === 'allowFullAccess' && workspace[key]) {
-    workspace.allowWrite = true;
-    config.writeTasksEnabled = true;
-    config.fullAccessEnabled = true;
-  }
-  if (key === 'allowWrite' && !workspace[key]) workspace.allowFullAccess = false;
+  const mode = parseWorkspacePermission(raw);
+  workspace.allowWrite = mode !== 'read-only';
+  workspace.allowFullAccess = mode === 'full-access';
   syncWorkspaceSandbox(workspace);
-  await saveAndRestart(`workspace ${alias} updated`);
+  syncGlobalAccessGates();
+  await saveAndRestart(`workspace ${alias} permissions set to ${mode}`);
 }
 
 async function setPort(raw) {
@@ -599,14 +583,11 @@ function printStatus() {
   console.log(`mcp    ${mcpHttpUrl()}`);
   console.log(`active ${workspace.alias} -> ${workspace.root}`);
   console.log(`access ${modeLabel(workspace)} for active workspace`);
+  console.log(`shell  ${config.pokedexCommandsEnabled ? 'enabled' : 'disabled'}`);
   console.log(
     `${config.workspaces.length} ${config.workspaces.length === 1 ? 'workspace' : 'workspaces'} configured`
   );
   console.log('tip    type "help" for commands');
-}
-
-function printConfig() {
-  console.log(stringifyConfigJsonc(redactConfig(config)));
 }
 
 function printWorkspaces() {
@@ -616,16 +597,16 @@ function printWorkspaces() {
   }
 }
 
-function printServiceOutput(name) {
+function printServiceLogs(name) {
   const names = name ? [name] : ['relay', 'agent', 'poke'];
   for (const key of names) {
     const lines = serviceLogs.get(key);
     if (!lines) {
-      console.log(`\n${serviceTitle(key)} output\nNo output yet.`);
+      console.log(`\n${serviceTitle(key)} logs\nNo logs yet.`);
       continue;
     }
-    console.log(`\n${serviceTitle(key)} output`);
-    console.log(lines.slice(-30).join('\n') || 'no output');
+    console.log(`\n${serviceTitle(key)} logs`);
+    console.log(lines.slice(-30).join('\n') || 'no logs');
   }
 }
 
@@ -658,16 +639,32 @@ function spawnManaged(name, bin, binArgs) {
     entry.exitCode = code ?? 0;
     entry.signal = signal;
     if (stopping || restarting) return;
-    statuses[name] = 'down';
-    if (name === 'relay') markRelayDependentsBlocked();
-    if (!readline) return;
-    const nextStep =
-      name === 'relay'
-        ? 'Type "status" or "restart"; type "help" for commands.'
-        : 'Type "status" or "restart"; type "help" for commands, or just ask your Poke.';
-    console.error(`\n⚠️ ${serviceTitle(name)} stopped. ${nextStep}`);
-    readline?.prompt();
+    void handleUnexpectedServiceExit(name);
   });
+}
+
+async function handleUnexpectedServiceExit(name) {
+  statuses[name] = 'down';
+  if (name === 'relay') markRelayDependentsBlocked();
+  if (!readline) return;
+  console.error(`\n⚠️ ${serviceTitle(name)} stopped. Closing the local MCP stack.`);
+  await closeStackAfterUnexpectedExit(name);
+}
+
+async function closeStackAfterUnexpectedExit(name) {
+  if (closingAfterServiceExit || stopping) return;
+  closingAfterServiceExit = true;
+  try {
+    await stopStack(false);
+    console.error(
+      `⚠️ ${serviceTitle(name)} stopped, so Pokedex closed the local MCP stack. Type "restart" to start it again.`
+    );
+  } catch (error) {
+    console.error(formatError(error));
+  } finally {
+    closingAfterServiceExit = false;
+    readline?.prompt();
+  }
 }
 
 function markRelayDependentsBlocked() {
@@ -708,7 +705,7 @@ function serviceFailure(name, detail) {
 
 function formatServiceOutput(name) {
   const lines = serviceLogs.get(name) ?? [];
-  return lines.length ? `${serviceTitle(name)} output:\n${lines.slice(-20).join('\n')}` : '';
+  return lines.length ? `${serviceTitle(name)} logs:\n${lines.slice(-20).join('\n')}` : '';
 }
 
 function appendLog(name, chunk) {
@@ -725,6 +722,8 @@ function appendLog(name, chunk) {
 
 async function stopStack(final) {
   restarting = !final;
+  const hadRelay = managedChildren.has('relay');
+  const relayPort = Number(config.port);
   const failures = new Set();
   // poke removes the temporary mcp connection from its own signal handler.
   if (!(await stopManagedChild('poke', 'SIGINT', 20_000))) failures.add('poke');
@@ -737,24 +736,45 @@ async function stopStack(final) {
   for (const { name, stopped: isStopped } of stopResults) {
     if (!isStopped) failures.add(name);
   }
+  if (
+    hadRelay &&
+    Number.isInteger(relayPort) &&
+    !(await waitForRelayPortClosed(relayPort, relayPortCloseTimeoutMs))
+  ) {
+    appendLog('relay', `relay port ${relayPort} is still in use after shutdown.`);
+    failures.add('relay');
+  }
   if (!final) {
     restarting = false;
     statuses.relay = 'idle';
     statuses.agent = 'idle';
     statuses.poke = 'idle';
   }
-  if (failures.size && !final)
-    throw new Error(
-      `${[...failures].map(serviceTitle).join(', ')} did not stop cleanly. Start was cancelled so no duplicate stack is left running.`
-    );
+  if (failures.size) {
+    const message = `${[...failures].map(serviceTitle).join(', ')} did not stop cleanly. Start was cancelled so no duplicate stack is left running.`;
+    if (!final) throw new Error(message);
+    console.error(`⚠️ ${message}`);
+    return false;
+  }
+  return true;
 }
 
 async function stopManaged(code) {
   if (stopping) return;
   stopping = true;
   readline?.close();
-  await stopStack(true);
-  process.exit(code);
+  const stopped = await stopStack(true);
+  process.exit(stopped ? code : 1);
+}
+
+async function waitForRelayPortClosed(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // a closed relay means the localhost port can be rebound.
+    if (await isPortAvailable(port)) return true;
+    await sleep(100);
+  }
+  return false;
 }
 
 async function stopManagedChild(name, signal, timeoutMs) {
@@ -902,6 +922,9 @@ function stringifyConfigJsonc(raw) {
     '',
     '  // global full-access gate; danger_full_access also needs allowFullAccess on the selected workspace.',
     `  "fullAccessEnabled": ${Boolean(raw.fullAccessEnabled)},`,
+    '',
+    '  // dangerous gate for pokedex_command. keep false unless you trust Poke to change Pokedex settings.',
+    `  "pokedexCommandsEnabled": ${Boolean(raw.pokedexCommandsEnabled)},`,
     '',
     '  // configured local workspaces that poke can ask codex to use.',
     '  "workspaces": [',
@@ -1123,6 +1146,12 @@ function syncWorkspaceSandbox(workspace) {
   workspace.defaultSandbox = sandboxFor(workspace.allowWrite, workspace.allowFullAccess);
 }
 
+function syncGlobalAccessGates() {
+  config.fullAccessEnabled = config.workspaces.some((workspace) => workspace.allowFullAccess);
+  config.writeTasksEnabled =
+    config.fullAccessEnabled || config.workspaces.some((workspace) => workspace.allowWrite);
+}
+
 function sandboxFor(writeEnabled, fullAccess) {
   if (fullAccess) return 'danger_full_access';
   if (writeEnabled) return 'workspace_write';
@@ -1130,8 +1159,8 @@ function sandboxFor(writeEnabled, fullAccess) {
 }
 
 function modeLabel(workspace) {
-  if (workspace.allowFullAccess) return 'full-access';
-  if (workspace.allowWrite) return 'write';
+  if (config.fullAccessEnabled && workspace.allowFullAccess) return 'full-access';
+  if (config.writeTasksEnabled && workspace.allowWrite) return 'write';
   return 'read-only';
 }
 
@@ -1151,9 +1180,9 @@ function serviceTitle(name) {
 
 function serviceHint(name, detail) {
   if (name === 'poke') return 'Run `npx poke@latest login`, then start Pokedex again.';
-  if (name === 'agent') return 'Type `output agent` to inspect Codex app-server output.';
+  if (name === 'agent') return 'Type `logs agent` to inspect Codex app-server logs.';
   if (name === 'relay')
-    return `Pokedex tries the next local port automatically. Type \`output relay\`, or run \`pokedex --port <number>\` to pin a port.`;
+    return `Pokedex tries the next local port automatically. Type \`logs relay\`, or run \`pokedex --port <number>\` to pin a port.`;
   return detail;
 }
 
@@ -1176,9 +1205,16 @@ function formatCommandHelp(commands) {
 
 function parseOnOff(raw, usage) {
   if (!raw) throw new Error(`usage: ${usage}`);
-  if (['on', 'true', 'yes', '1'].includes(raw)) return true;
-  if (['off', 'false', 'no', '0'].includes(raw)) return false;
+  if (raw === 'on') return true;
+  if (raw === 'off') return false;
   throw new Error('use on or off');
+}
+
+function parseWorkspacePermission(raw) {
+  const value = raw?.toLowerCase().replace(/_/g, '-');
+  if (!value) throw new Error('usage: ws perms <alias> read-only|write|full-access');
+  if (['read-only', 'write', 'full-access'].includes(value)) return value;
+  throw new Error('allowed permissions: read-only, write, full-access');
 }
 
 function assertAlias(alias) {
@@ -1209,10 +1245,6 @@ function splitCommand(line) {
   }
   if (current) parts.push(current);
   return parts;
-}
-
-function redactConfig(raw) {
-  return { ...raw, relayToken: raw.relayToken ? `${raw.relayToken.slice(0, 6)}...` : '' };
 }
 
 function mcpHttpUrl() {

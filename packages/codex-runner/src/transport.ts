@@ -1,4 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
 import { redactSecrets } from '@pokedex/security';
 import { gitHeadlessEnv } from './local.js';
 import type { AgentConfig } from '@pokedex/protocol';
@@ -12,6 +15,8 @@ type PendingRequest = {
 };
 
 const eventHistoryLimit = 500;
+const codexAuthStatusTimeoutMs = 10_000;
+const ansiEscapePattern = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
 
 export class AppServerTransport {
   private child: AppServerProcess | null = null;
@@ -87,7 +92,11 @@ export class AppServerTransport {
   }
 
   private ensureStarted(config: AgentConfig): void {
-    const commandKey = JSON.stringify([config.appServerCommand, config.appServerArgs]);
+    const commandKey = JSON.stringify([
+      config.appServerCommand,
+      config.appServerArgs,
+      codexAuthFingerprint(config),
+    ]);
     if (this.child && !childExited(this.child) && this.commandKey !== commandKey) this.stop();
     if (this.child && !childExited(this.child)) return;
 
@@ -207,6 +216,55 @@ export class AppServerTransport {
 
 function childExited(child: AppServerProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
+}
+
+function codexAuthFingerprint(config: AgentConfig): string {
+  if (!tracksCodexAuth(config.appServerCommand)) return 'custom-command';
+  const status = codexLoginStatus(config.appServerCommand);
+  const authFile = codexAuthFileFingerprint();
+  return JSON.stringify({ status, authFile });
+}
+
+function tracksCodexAuth(command: string): boolean {
+  return /^codex(?:\.cmd|\.exe)?$/i.test(basename(command));
+}
+
+function codexLoginStatus(command: string): string {
+  const result = spawnSync(command, ['login', 'status'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: codexAuthStatusTimeoutMs,
+    env: { ...process.env, npm_config_update_notifier: 'false' },
+  });
+  if (result.error || result.status !== 0) return 'unavailable';
+  return normalizeCommandOutput(`${result.stdout}\n${result.stderr}`) ?? 'empty';
+}
+
+function codexAuthFileFingerprint(): string {
+  const path = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json');
+  if (!existsSync(path)) return 'missing';
+  try {
+    const stat = statSync(path);
+    // file metadata is enough to invalidate stale app-server auth without reading token contents.
+    return JSON.stringify({
+      size: stat.size,
+      mtimeMs: Math.trunc(stat.mtimeMs),
+      ctimeMs: Math.trunc(stat.ctimeMs),
+    });
+  } catch {
+    return 'unavailable';
+  }
+}
+
+function normalizeCommandOutput(output: string): string | null {
+  const text = output
+    .replace(ansiEscapePattern, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^npm\b/i.test(line) && !/update available/i.test(line))
+    .join('\n');
+  return text || null;
 }
 
 function signalChild(child: AppServerProcess, signal: NodeJS.Signals): void {

@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   AgentConfigSchema,
   ThreadStartSchema,
+  codexPromptGuidance,
   mcpToolNames,
   parseJsonc,
+  pokeResponseGuidance,
+  supportedPokedexCommands,
   stableCapabilities,
   toMcpText,
 } from '../packages/protocol/src/index.js';
@@ -21,6 +24,7 @@ describe('protocol schemas', () => {
     expect(parsed.userId).toBe('user');
     expect(parsed.relayUrl).toBe('ws://localhost:3000/agent');
     expect(parsed.appServerArgs).toEqual(['app-server', '--listen', 'stdio://']);
+    expect(parsed.pokedexCommandsEnabled).toBe(false);
     expect(parsed.workspaces[0]?.defaultSandbox).toBe('read_only');
   });
 
@@ -81,16 +85,50 @@ describe('protocol schemas', () => {
     expect(tools.some((tool) => tool.name === 'pokedex_list_plugins')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_read_operation')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_git_check')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_git_commit')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_git_push')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_git_commit_push')).toBe(true);
     expect(tools.some((tool) => tool.name === 'pokedex_approve')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'pokedex_command')).toBe(true);
     expect(
       JSON.stringify(tools.find((tool) => tool.name === 'pokedex_read_operation')?.inputSchema)
     ).toContain('waitMs');
     expect(tools.find((tool) => tool.name === 'pokedex_get_usage')?.description).toContain(
       'rate limits'
     );
+    expect(tools.find((tool) => tool.name === 'pokedex_command')?.description).toContain(
+      'ws add/rm/use/desc/perms'
+    );
+    expect(tools.find((tool) => tool.name === 'pokedex_start_thread')?.description).toContain(
+      codexPromptGuidance
+    );
+    expect(tools.find((tool) => tool.name === 'pokedex_start_thread')?.description).toContain(
+      pokeResponseGuidance
+    );
+    expect(pokeResponseGuidance).toContain('Pokedex tool results');
+    expect(pokeResponseGuidance).not.toContain('profanity');
+    expect(pokeResponseGuidance).not.toContain('insults');
+    expect(tools.find((tool) => tool.name === 'pokedex_git_check')?.description).toContain(
+      'do not invent commands'
+    );
+    expect(tools.find((tool) => tool.name === 'pokedex_git_commit')?.description).toContain(
+      'without asking Codex to run shell commands'
+    );
+    expect(tools.find((tool) => tool.name === 'pokedex_git_push')?.description).toContain(
+      'requires workspace full-access'
+    );
+    expect(tools.find((tool) => tool.name === 'pokedex_command')?.description).not.toContain(
+      'config'
+    );
     expect(tools.every((tool) => tool.inputSchema && typeof tool.inputSchema === 'object')).toBe(
       true
     );
+  });
+
+  it('keeps command grammar canonical in protocol data', () => {
+    expect(supportedPokedexCommands).toContain('ws rm <alias>');
+    expect(supportedPokedexCommands).toContain('ws perms <alias> read-only|write|full-access');
+    expect(supportedPokedexCommands.join('\n')).not.toContain('ws remove');
   });
 
   it('formats mcp tool output without raw debug events', () => {
@@ -122,6 +160,28 @@ describe('protocol schemas', () => {
     expect(
       stableCapabilities.some(
         (capability) => capability.name === 'git_check' && capability.source === 'cli'
+      )
+    ).toBe(true);
+  });
+
+  it('declares structured git write capabilities', () => {
+    expect(
+      stableCapabilities.some(
+        (capability) => capability.name === 'git_commit' && capability.source === 'cli'
+      )
+    ).toBe(true);
+    expect(
+      stableCapabilities.some(
+        (capability) => capability.name === 'git_push' && capability.source === 'cli'
+      )
+    ).toBe(true);
+  });
+
+  it('declares gated Pokedex command capability', () => {
+    expect(
+      stableCapabilities.some(
+        (capability) =>
+          capability.name === 'pokedex_commands' && capability.source === 'local_config'
       )
     ).toBe(true);
   });

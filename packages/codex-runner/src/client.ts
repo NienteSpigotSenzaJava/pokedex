@@ -8,6 +8,7 @@ import type {
   RuntimeSettingsSchema,
   SkillList,
   ToolResult,
+  Workspace,
 } from '@pokedex/protocol';
 import {
   ApprovalApproveSchema,
@@ -62,7 +63,7 @@ import {
 import { AppServerTransport } from './transport.js';
 import type { AppServerEvent, JsonRecord, RunnerProgress, RunnerResult } from './types.js';
 import { extractUsage, latestUsage } from './usage.js';
-import { asRecord, isRpcId, stripUndefined } from './utils.js';
+import { asRecord, isRpcId, stringFrom, stripUndefined } from './utils.js';
 
 type RuntimeSettings = ReturnType<typeof RuntimeSettingsSchema.parse>;
 type OptionalEndpointResult = {
@@ -114,6 +115,7 @@ export class CodexAppServerClient {
       params.cwd = resolveWorkspaceRoot(findWorkspace(config, args.workspaceAlias));
 
     const result = await this.request(config, 'thread/list', stripUndefined(params));
+    this.rememberThreadCwdsFromResult(config, result);
     return { ok: true, summary: 'codex local threads loaded.', data: { result } };
   }
 
@@ -192,7 +194,7 @@ export class CodexAppServerClient {
       const started = await this.request(
         config,
         'thread/start',
-        stripUndefined({ cwd, name: task.name, settings })
+        stripUndefined({ cwd, name: task.name, ephemeral: false, settings })
       );
       const threadId = extractThreadId(started);
       if (!threadId) throw new Error('codex app-server did not return a thread id');
@@ -212,8 +214,10 @@ export class CodexAppServerClient {
     onProgress?: (progress: RunnerProgress) => void
   ): Promise<RunnerResult> {
     const task = TurnStartSchema.parse(input);
-    const cwd = this.cwdForTurn(config, task.threadId, task.workspaceAlias);
+    const workspace = this.workspaceForTurn(config, task.threadId, task.workspaceAlias);
+    const cwd = resolveWorkspaceRoot(workspace);
     const skills = await this.resolveTurnSkills(config, cwd, task);
+    const settings = buildSettings(config, workspace, task);
     const events: unknown[] = [];
     const off = this.collect(events, onProgress, task.threadId);
 
@@ -223,18 +227,12 @@ export class CodexAppServerClient {
         'turn/start',
         {
           threadId: task.threadId,
+          cwd,
           input: [
             ...skills.map(({ name, path }) => ({ type: 'skill', name, path })),
             { type: 'text', text: task.prompt },
           ],
-          settings: stripUndefined({
-            model: task.model ?? config.defaultModel,
-            profile: task.profile,
-            model_reasoning_effort: task.reasoningEffort ?? config.defaultReasoning,
-            model_verbosity: task.verbosity ?? config.defaultVerbosity,
-            approval_policy: task.approvalPolicy ?? config.defaultApprovalPolicy,
-            web_search: task.webSearch,
-          }),
+          settings,
         },
         task.threadId
       );
@@ -245,6 +243,9 @@ export class CodexAppServerClient {
           finalMessage: approvalWaitMessage(outcome.approval),
           usage: UsageSchema.parse({}),
           events,
+          cwd,
+          workspaceAlias: workspace.alias,
+          settings,
         };
       }
 
@@ -256,6 +257,9 @@ export class CodexAppServerClient {
         finalMessage: extractFinalMessage(result) || 'turn started.',
         usage: latestUsage([...events, result]) ?? UsageSchema.parse({}),
         events,
+        cwd,
+        workspaceAlias: workspace.alias,
+        settings,
       };
     } finally {
       off();
@@ -268,13 +272,15 @@ export class CodexAppServerClient {
     onProgress?: (progress: RunnerProgress) => void
   ): Promise<RunnerResult> {
     const task = TurnStartSchema.parse(input);
+    const workspace = this.workspaceForTurn(config, task.threadId, task.workspaceAlias);
     await this.request(config, 'thread/resume', { threadId: task.threadId });
-    return this.startTurn(config, task, onProgress);
+    return this.startTurn(config, { ...task, workspaceAlias: workspace.alias }, onProgress);
   }
 
   async readThread(config: AgentConfig, input: unknown): Promise<ToolResult> {
     const args = ThreadReadSchema.parse(input);
     const result = await this.request(config, 'thread/read', args);
+    this.rememberThreadCwdsFromResult(config, result);
     return { ok: true, summary: `thread ${args.threadId} loaded.`, data: { result } };
   }
 
@@ -519,21 +525,41 @@ export class CodexAppServerClient {
     });
   }
 
-  private cwdForTurn(
+  private workspaceForTurn(
     config: AgentConfig,
     threadId: string,
     workspaceAlias: string | undefined
-  ): string {
+  ): Workspace {
     if (workspaceAlias) {
-      const cwd = resolveWorkspaceRoot(findWorkspace(config, workspaceAlias));
-      this.threadCwds.set(threadId, cwd);
-      return cwd;
+      const workspace = findWorkspace(config, workspaceAlias);
+      this.threadCwds.set(threadId, resolveWorkspaceRoot(workspace));
+      return workspace;
     }
+
     const cached = this.threadCwds.get(threadId);
-    if (cached) return cached;
-    const workspace = config.workspaces[0];
-    if (!workspace) throw new Error('no workspace configured');
-    return resolveWorkspaceRoot(workspace);
+    if (cached) {
+      const workspace = config.workspaces.find((item) => resolveWorkspaceRoot(item) === cached);
+      if (workspace) return workspace;
+    }
+
+    if (config.workspaces.length === 1) {
+      const workspace = config.workspaces[0]!;
+      this.threadCwds.set(threadId, resolveWorkspaceRoot(workspace));
+      return workspace;
+    }
+
+    throw new Error(
+      `workspaceAlias is required for thread ${threadId} because Pokedex has multiple workspaces and does not know which one this thread belongs to after reconnect. call pokedex_list_threads or pokedex_read_thread, then retry with the matching workspaceAlias.`
+    );
+  }
+
+  private rememberThreadCwdsFromResult(config: AgentConfig, result: unknown): void {
+    for (const thread of threadRecords(result)) {
+      const id = stringFrom(thread.id);
+      if (!id) continue;
+      const root = mentionedWorkspaceRoot(config, thread);
+      if (root) this.threadCwds.set(id, root);
+    }
   }
 
   private async resolveTurnSkills(
@@ -621,4 +647,37 @@ export class CodexAppServerClient {
     const requestId = asRecord(event.raw).id;
     return isRpcId(requestId) ? this.approvals.findByRequestId(requestId) : null;
   }
+}
+
+function threadRecords(value: unknown, depth = 0): JsonRecord[] {
+  if (depth > 8) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => threadRecords(item, depth + 1));
+  const raw = asRecord(value);
+  const nested = Object.values(raw).flatMap((item) => threadRecords(item, depth + 1));
+  return looksLikeThread(raw) ? [raw, ...nested] : nested;
+}
+
+function looksLikeThread(record: JsonRecord): boolean {
+  return Boolean(
+    stringFrom(record.id) &&
+    ('turns' in record ||
+      'preview' in record ||
+      'createdAt' in record ||
+      'path' in record ||
+      'status' in record)
+  );
+}
+
+function mentionedWorkspaceRoot(config: AgentConfig, record: JsonRecord): string | undefined {
+  return config.workspaces
+    .map((workspace) => resolveWorkspaceRoot(workspace))
+    .find((root) => valueMentions(record, root));
+}
+
+function valueMentions(value: unknown, needle: string, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (typeof value === 'string') return value.includes(needle);
+  if (Array.isArray(value)) return value.some((item) => valueMentions(item, needle, depth + 1));
+  const raw = asRecord(value);
+  return Object.values(raw).some((item) => valueMentions(item, needle, depth + 1));
 }

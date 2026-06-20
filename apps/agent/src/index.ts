@@ -7,6 +7,7 @@ import WebSocket, { type RawData } from 'ws';
 import {
   AgentConfigSchema,
   AgentRequestSchema,
+  RuntimeSettingsSchema,
   UsageSchema,
   parseJsonc,
   type AgentConfig,
@@ -15,12 +16,17 @@ import {
 } from '@pokedex/protocol';
 import {
   CodexAppServerClient,
+  buildSettings,
   capabilitiesResult,
   diffResult,
   gitCheckResult,
+  gitCommitPushResult,
+  gitCommitResult,
+  gitPushResult,
   type RunnerProgress,
 } from '@pokedex/codex-runner';
-import { redactSecrets } from '@pokedex/security';
+import { findWorkspace, redactSecrets, resolveWorkspaceRoot } from '@pokedex/security';
+import { listWorkspaces, pokedexCommandResult } from './pokedex-commands.js';
 
 type UsageSnapshot = {
   at: string;
@@ -66,6 +72,9 @@ type OperationRecord = {
   lastUsage?: Usage;
   threadId?: string;
   turnId?: string;
+  workspaceAlias?: string;
+  cwd?: string;
+  settings?: Record<string, unknown>;
   rateLimits?: unknown;
   rateLimitStatus?: RateLimitStatus;
   waiters: Set<() => void>;
@@ -77,6 +86,7 @@ const configPath = value('--config') ?? existingDefaultConfigPath();
 const codex = new CodexAppServerClient();
 const operations = new Map<string, OperationRecord>();
 const operationReturnDeadlineMs = 8_000;
+const operationStalledAfterMs = 120_000;
 const maxOperations = 50;
 let activeSocket: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | undefined;
@@ -179,27 +189,27 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_list_operations') return listOperations();
   if (toolName === 'pokedex_read_operation') return await readOperation(args);
   if (toolName === 'pokedex_start_task')
-    return await trackOperation(config, toolName, 'task start', async (onProgress) =>
+    return await trackOperation(config, toolName, 'task start', args, async (onProgress) =>
       runnerResultToTool('codex task started.', await codex.startThread(config, args, onProgress))
     );
   if (toolName === 'pokedex_start_thread')
-    return await trackOperation(config, toolName, 'thread start', async (onProgress) =>
+    return await trackOperation(config, toolName, 'thread start', args, async (onProgress) =>
       runnerResultToTool('codex thread started.', await codex.startThread(config, args, onProgress))
     );
   if (toolName === 'pokedex_continue_task')
-    return await trackOperation(config, toolName, 'task turn', async (onProgress) =>
+    return await trackOperation(config, toolName, 'task turn', args, async (onProgress) =>
       runnerResultToTool('codex task continued.', await codex.startTurn(config, args, onProgress))
     );
   if (toolName === 'pokedex_send_turn')
-    return await trackOperation(config, toolName, 'thread turn', async (onProgress) =>
+    return await trackOperation(config, toolName, 'thread turn', args, async (onProgress) =>
       runnerResultToTool('codex turn sent.', await codex.startTurn(config, args, onProgress))
     );
   if (toolName === 'pokedex_resume_task')
-    return await trackOperation(config, toolName, 'task resume', async (onProgress) =>
+    return await trackOperation(config, toolName, 'task resume', args, async (onProgress) =>
       runnerResultToTool('codex task resumed.', await codex.resumeThread(config, args, onProgress))
     );
   if (toolName === 'pokedex_resume_thread')
-    return await trackOperation(config, toolName, 'thread resume', async (onProgress) =>
+    return await trackOperation(config, toolName, 'thread resume', args, async (onProgress) =>
       runnerResultToTool(
         'codex thread resumed.',
         await codex.resumeThread(config, args, onProgress)
@@ -210,7 +220,7 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_set_goal') return await codex.setGoal(config, args);
   if (toolName === 'pokedex_clear_goal') return await codex.clearGoal(config, args);
   if (toolName === 'pokedex_review')
-    return await trackOperation(config, toolName, 'review', async (onProgress) =>
+    return await trackOperation(config, toolName, 'review', args, async (onProgress) =>
       runnerResultToTool('codex review started.', await codex.review(config, args, onProgress))
     );
   if (toolName === 'pokedex_interrupt') return await codex.interrupt(config, args);
@@ -220,7 +230,11 @@ async function dispatch(toolName: string, args: Record<string, unknown>): Promis
   if (toolName === 'pokedex_cancel_approval') return await codex.cancelApproval(args);
   if (toolName === 'pokedex_get_diff') return await diffResult(config, args);
   if (toolName === 'pokedex_git_check') return await gitCheckResult(config, args);
+  if (toolName === 'pokedex_git_commit') return await gitCommitResult(config, args);
+  if (toolName === 'pokedex_git_push') return await gitPushResult(config, args);
+  if (toolName === 'pokedex_git_commit_push') return await gitCommitPushResult(config, args);
   if (toolName === 'pokedex_get_usage') return await usageResult(config);
+  if (toolName === 'pokedex_command') return pokedexCommandResult(config, args, configPath);
 
   return {
     ok: false,
@@ -233,10 +247,11 @@ async function trackOperation(
   config: AgentConfig,
   toolName: string,
   label: string,
+  args: Record<string, unknown>,
   run: (onProgress: (progress: RunnerProgress) => void) => Promise<ToolResult>
 ): Promise<ToolResult> {
   pruneOperations();
-  const operation = createOperation(toolName, label);
+  const operation = createOperation(config, toolName, label, args);
   const onProgress = (progress: RunnerProgress) => {
     trackRunnerProgress(progress);
     trackOperationProgress(operation, progress);
@@ -262,18 +277,55 @@ async function trackOperation(
   return operationResult(operation);
 }
 
-function createOperation(toolName: string, label: string): OperationRecord {
+function createOperation(
+  config: AgentConfig,
+  toolName: string,
+  label: string,
+  args: Record<string, unknown>
+): OperationRecord {
   const operationId = `op-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const metadata = operationMetadata(config, args);
   return {
     operationId,
     toolName,
     label,
     status: 'running',
     startedAt: new Date().toISOString(),
+    ...metadata,
     eventsSeen: 0,
     waiters: new Set(),
     promise: Promise.resolve(),
   };
+}
+
+function operationMetadata(
+  config: AgentConfig,
+  args: Record<string, unknown>
+): Pick<OperationRecord, 'workspaceAlias' | 'cwd' | 'settings' | 'threadId'> {
+  const threadId = stringFrom(args.threadId);
+  const workspaceAlias =
+    stringFrom(args.workspaceAlias) ??
+    (config.workspaces.length === 1 ? config.workspaces[0]?.alias : undefined);
+  if (!workspaceAlias)
+    return stripUndefined({ threadId }) as Pick<
+      OperationRecord,
+      'workspaceAlias' | 'cwd' | 'settings' | 'threadId'
+    >;
+
+  try {
+    const workspace = findWorkspace(config, workspaceAlias);
+    const cwd = resolveWorkspaceRoot(workspace);
+    const settings = buildSettings(config, workspace, RuntimeSettingsSchema.parse(args));
+    return stripUndefined({ threadId, workspaceAlias, cwd, settings }) as Pick<
+      OperationRecord,
+      'workspaceAlias' | 'cwd' | 'settings' | 'threadId'
+    >;
+  } catch {
+    return stripUndefined({ threadId, workspaceAlias }) as Pick<
+      OperationRecord,
+      'workspaceAlias' | 'cwd' | 'settings' | 'threadId'
+    >;
+  }
 }
 
 function listOperations(): ToolResult {
@@ -366,6 +418,11 @@ function operationData(operation: OperationRecord): Record<string, unknown> {
     lastUsage: operation.lastUsage,
     threadId: operation.threadId,
     turnId: operation.turnId,
+    workspaceAlias: operation.workspaceAlias,
+    cwd: operation.cwd,
+    settings: operation.settings,
+    operationHealth: operationHealth(operation),
+    stalledMs: operationStalledMs(operation),
     rateLimitStatus: operation.rateLimitStatus,
     rateLimits: operation.rateLimits,
     failureKind: operation.failureKind,
@@ -399,6 +456,12 @@ function trackOperationProgress(operation: OperationRecord, progress: RunnerProg
 function syncOperationFromResult(operation: OperationRecord, result: ToolResult): void {
   const threadId = stringFrom(result.data.threadId);
   if (threadId) operation.threadId ??= threadId;
+  const workspaceAlias = stringFrom(result.data.workspaceAlias);
+  if (workspaceAlias) operation.workspaceAlias ??= workspaceAlias;
+  const cwd = stringFrom(result.data.cwd);
+  if (cwd) operation.cwd ??= cwd;
+  const settings = asRecord(result.data.settings);
+  if (Object.keys(settings).length) operation.settings ??= settings;
   const usage = usageFrom(result.data.usage);
   if (usage) operation.lastUsage = usage;
 }
@@ -480,8 +543,11 @@ function notifyOperation(operation: OperationRecord): void {
 }
 
 function runningOperationSummary(operation: OperationRecord): string {
+  const stalledMs = operationStalledMs(operation);
   const detail = [
-    `running for ${formatDuration(operationElapsedMs(operation))}`,
+    stalledMs
+      ? `stalled for ${formatDuration(stalledMs)}`
+      : `running for ${formatDuration(operationElapsedMs(operation))}`,
     operation.lastEventName ? `last event ${operation.lastEventName}` : '',
     operation.lastStatus ? `status ${operation.lastStatus}` : '',
     operation.lastMessage ? `message: ${operation.lastMessage}` : '',
@@ -509,7 +575,21 @@ function failedOperationNextAction(operation: OperationRecord): string {
 }
 
 function pollInstruction(operation: OperationRecord): string {
+  if (operationStalledMs(operation))
+    return `call pokedex_read_operation again with operationId ${operation.operationId}, afterEventsSeen ${operation.eventsSeen}, and waitMs up to 30000; if it remains stalled, inspect logs or interrupt the thread before retrying the request.`;
   return `call pokedex_read_operation again with operationId ${operation.operationId}, afterEventsSeen ${operation.eventsSeen}, and waitMs up to 30000 until operationStatus is completed or failed.`;
+}
+
+function operationHealth(operation: OperationRecord): 'active' | 'stalled' | undefined {
+  if (operation.status !== 'running') return undefined;
+  return operationStalledMs(operation) ? 'stalled' : 'active';
+}
+
+function operationStalledMs(operation: OperationRecord): number | undefined {
+  if (operation.status !== 'running') return undefined;
+  const lastSignalAt = Date.parse(operation.lastProgressAt ?? operation.startedAt);
+  const stalledMs = Date.now() - lastSignalAt;
+  return stalledMs >= operationStalledAfterMs ? stalledMs : undefined;
 }
 
 function normalizeRateLimitStatus(value: unknown): RateLimitStatus | undefined {
@@ -719,29 +799,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function listWorkspaces(config: AgentConfig): ToolResult {
-  return {
-    ok: true,
-    summary: 'configured workspaces loaded. access is the effective workspace access label.',
-    data: {
-      workspaces: config.workspaces.map((workspace) => ({
-        alias: workspace.alias,
-        description: workspace.description,
-        access: workspaceAccess(config, workspace),
-      })),
-    },
-  };
-}
-
-function workspaceAccess(
-  config: AgentConfig,
-  workspace: AgentConfig['workspaces'][number]
-): string {
-  if (config.fullAccessEnabled && workspace.allowFullAccess) return 'full access';
-  if (config.writeTasksEnabled && workspace.allowWrite) return 'write access';
-  return 'read only';
-}
-
 async function usageResult(config: AgentConfig): Promise<ToolResult> {
   resetTodayIfNeeded();
   const rateLimits = await codex.readRateLimits(config).catch((error: unknown): ToolResult => {
@@ -791,7 +848,15 @@ function trackRunnerProgress(progress: RunnerProgress): void {
 
 function runnerResultToTool(
   summary: string,
-  result: { threadId?: string; finalMessage: string; usage: unknown; events: unknown[] }
+  result: {
+    threadId?: string;
+    finalMessage: string;
+    usage: unknown;
+    events: unknown[];
+    cwd?: string;
+    workspaceAlias?: string;
+    settings?: Record<string, unknown>;
+  }
 ): ToolResult {
   const usage = usageFrom(result.usage);
   if (usage) {
@@ -804,11 +869,14 @@ function runnerResultToTool(
   const toolResult = {
     ok: true,
     summary,
-    data: {
+    data: stripUndefined({
       threadId: result.threadId,
+      workspaceAlias: result.workspaceAlias,
+      cwd: result.cwd,
+      settings: result.settings,
       finalMessage: result.finalMessage,
       usage: result.usage,
-    },
+    }),
   };
   return toolResult;
 }

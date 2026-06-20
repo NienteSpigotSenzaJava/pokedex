@@ -2,7 +2,10 @@ export { capabilitiesResult, CodexAppServerClient } from './client.js';
 export {
   diffResult,
   gitCheckResult,
+  gitCommitPushResult,
+  gitCommitResult,
   gitHeadlessEnv,
+  gitPushResult,
   runPlainCommand,
   setupCheckResult,
 } from './local.js';

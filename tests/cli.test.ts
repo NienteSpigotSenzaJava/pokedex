@@ -16,13 +16,26 @@ describe('pokedex cli', () => {
     expect(output).toContain('pokedex help');
     expect(output).toContain('[--port 4200]');
     expect(output).toContain('~/.pokedex/config.jsonc');
-    expect(output).toContain('output [relay|agent|poke]');
+    expect(output).toContain('logs [relay|agent|poke]');
     expect(output).toContain('show recent logs for one service or all services');
+    expect(output).toContain('shell <on|off>');
+    expect(output).toContain('dangerous: allow Poke to run Pokedex prompt commands');
     expect(output).toContain('ws add <alias> <path> [description]');
     expect(output).toContain('add or update a workspace');
-    expect(output).toContain('write <on|off>');
-    expect(output).toContain('ws write <alias> <on|off>');
-    expect(output).not.toContain('write [on|off]');
+    expect(output).toContain('ws rm <alias>');
+    expect(output).toContain('ws use <alias>');
+    expect(output).toContain('ws desc <alias> <description>');
+    expect(output).toContain('ws perms <alias> read-only|write|full-access');
+    expect(output).toContain('set workspace access');
+    expect(output).not.toContain('config                                      ');
+    expect(output).not.toContain('output [relay|agent|poke]');
+    expect(output).not.toContain('ws remove');
+    expect(output).not.toContain('ws switch');
+    expect(output).not.toContain('ws describe');
+    expect(output).not.toContain('ws permissions');
+    expect(output).not.toContain(`write <${'on|off'}>`);
+    expect(output).not.toContain(`full-access <${'on|off'}>`);
+    expect(output).not.toContain(`${['ws', 'write'].join(' ')} <alias> <${'on|off'}>`);
     expect(output).not.toContain('codex <command>');
   });
 
@@ -95,6 +108,10 @@ describe('pokedex cli', () => {
     expect(source).toContain('optional relay port override');
     expect(source).toContain('global write gate; workspace_write also needs allowWrite');
     expect(source).toContain('workspace full-access gate; danger_full_access needs this');
+    expect(source).toContain('dangerous gate for pokedex_command');
+    expect(source).toContain(
+      '`  "pokedexCommandsEnabled": ${Boolean(raw.pokedexCommandsEnabled)},`'
+    );
     expect(source).toContain('`  "appServerArgs": ${inlineArray(raw.appServerArgs)},`');
   });
 
@@ -146,7 +163,9 @@ describe('pokedex cli', () => {
   it('keeps normal config edits live without restarting the mcp stack', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain("if (name === 'approval' || name === 'approve')");
+    expect(source).toContain("if (name === 'approval')");
+    expect(source).not.toContain("name === 'approve'");
+    expect(source).toContain("if (name === 'shell') return await setShell(subcommand);");
     expect(source).toContain('await saveSetting(key, raw);');
     expect(source).toContain("await saveSetting('port', config.port, true);");
   });
@@ -166,38 +185,57 @@ describe('pokedex cli', () => {
     expect(source).toContain('return child.exitCode !== null || child.signalCode !== null;');
   });
 
+  it('closes the local mcp stack when a managed service stops unexpectedly', () => {
+    const source = readFileSync(cliPath, 'utf8');
+
+    expect(source).toContain('void handleUnexpectedServiceExit(name);');
+    expect(source).toContain('async function closeStackAfterUnexpectedExit(name)');
+    expect(source).toContain('Closing the local MCP stack.');
+    expect(source).toContain('await stopStack(false);');
+    expect(source).toContain('Pokedex closed the local MCP stack. Type "restart"');
+  });
+
   it('waits for detached process groups to stop before restarting', () => {
     const source = readFileSync(cliPath, 'utf8');
 
     expect(source).toContain('const managedShutdownPollMs = 50;');
+    expect(source).toContain('const relayPortCloseTimeoutMs = 2_000;');
     expect(source).toContain('await waitForManagedChildExit(entry, timeoutMs)');
     expect(source).toContain('await waitForManagedChildExit(entry, 2_000)');
+    expect(source).toContain('await waitForRelayPortClosed(relayPort, relayPortCloseTimeoutMs)');
+    expect(source).toContain('relay port ${relayPort} is still in use after shutdown.');
     expect(source).toContain('process.kill(-pid, 0)');
     expect(source).toContain('process.kill(-entry.child.pid, signal)');
     expect(source).toContain('Start was cancelled so no duplicate stack is left running.');
   });
 
-  it('makes workspace write on effective immediately and after restart', () => {
+  it('sets workspace permissions through one explicit command', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain(
-      "if (key === 'allowWrite' && workspace[key]) config.writeTasksEnabled = true;"
-    );
+    expect(source).toContain("workspace.allowWrite = mode !== 'read-only';");
+    expect(source).toContain("workspace.allowFullAccess = mode === 'full-access';");
+    expect(source).toContain('function syncGlobalAccessGates()');
+    expect(source).toContain('config.fullAccessEnabled = config.workspaces.some');
     expect(source).toContain(
       'Boolean(saved.writeTasksEnabled || fullAccess || existing?.allowWrite || first.allowWrite)'
     );
     expect(source).toContain('writeTasksEnabled: writeEnabled');
   });
 
-  it('requires explicit on or off for access commands', () => {
+  it('keeps shell on/off explicit and workspace access mode-based', () => {
     const source = readFileSync(cliPath, 'utf8');
 
-    expect(source).toContain("parseOnOff(raw, 'write <on|off>')");
-    expect(source).toContain("parseOnOff(raw, 'full-access <on|off>')");
+    expect(source).toContain("parseOnOff(raw, 'shell <on|off>')");
+    expect(source).toContain('parseWorkspacePermission(raw)');
+    expect(source).toContain('usage: ws perms <alias> read-only|write|full-access');
     expect(source).toContain('throw new Error(`usage: ${usage}`);');
-    expect(source).toContain('ws write <alias> <on|off>');
+    expect(source).not.toContain(`parseOnOff(raw, 'write <${'on|off'}>')`);
+    expect(source).not.toContain(`parseOnOff(raw, 'full-access <${'on|off'}>')`);
     expect(source).not.toContain('parseOnOff(raw, !');
     expect(source).not.toContain("if (name === 'codex')");
     expect(source).not.toContain('async function setCodex');
+    expect(source).not.toContain("['on', 'true', 'yes', '1']");
+    expect(source).not.toContain("'readonly'");
+    expect(source).not.toContain("'workspace-write'");
   });
 });
